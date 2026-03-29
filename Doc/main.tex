@@ -1,0 +1,259 @@
+% Inference/Model
+
+% 1. Use duckdb to read relbench-style dataset
+% 2. For a specific inference (x, t) pair construct  a sequence of s = emb(x, t_i), y_i pair  of length k from the duckdb database. Here if i<j, then t_i < t_j < t. emb will be a tgnn/graph_transformer/relational encoder. For now tgat and GT encoder, later we will use tgn encoder. 
+% 3. Feed [s, emb(x,t)] to an LLM and predict Y
+
+
+% Training Plan:
+% 1. Keep the llm frozen. No fine-tuning of LLM
+% 2. Pick a set of relbench style datasets
+% 3. Pick all the tasks that can be defined on it.
+% 4. Randomly sample a batch of train (x, t), y pairs from all the tasks and all the datasets. Sampler should sample without replacement in and across batch so, for one train epoch each train x is just seen once. 
+% 5. Objective to mix different dataset and task in the same batch is to train tgnn encoder in a task agnostic way. so, the embedding is task agnostic. Before passing to llm, as each sequence is for one specific task, we will add a task description, then the sequence of train icl examples, and target emb(x, t). So, a batch will be a collection of different tasks but a sequence will have example for just one task and one entity.
+% 6. Loss and backprop will only update encoder params, treating LLM as a fixed function.
+
+
+
+
+\documentclass[11pt]{article}
+
+\usepackage[T1]{fontenc}
+\usepackage{textcomp}
+\usepackage{mathptmx}
+\usepackage{amsmath, amssymb}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\usepackage{geometry}
+\geometry{margin=1in}
+
+\title{\textbf{Relational Foundation Models via Temporal In-Context Learning over Graph Encoders}}
+\author{}
+\date{}
+
+\begin{document}
+
+\maketitle
+
+\section{Introduction}
+
+We propose a novel framework for \textit{Relational Foundation Models (RFM)} that combines temporal relational encoders with in-context learning (ICL) using a frozen Large Language Model (LLM) \cite{dummy-rfm-note}. 
+
+The core idea is to learn a \textbf{task-agnostic relational encoder} whose outputs can be interpreted by a frozen LLM through example-based conditioning. This design decouples representation learning from task-specific reasoning, enabling modularity, generalization, and adaptability to future LLMs.
+
+\section{Problem Setup}
+
+We assume a relational dataset stored in a database (e.g., DuckDB) with temporal information. Each query is of the form:
+
+\begin{equation}
+(x, t) \rightarrow y
+\end{equation}
+
+where $x$ is an entity, $t$ is a timestamp, and $y$ is the target variable. Tasks include link prediction, node classification/regression, and forecasting.
+
+\section{Framework Overview}
+
+\subsection{Context Construction}
+
+For each query $(x,t)$, we construct a temporally valid context:
+
+\begin{equation}
+\mathcal{C} = \{(x, t_i, y_i)\}_{i=1}^{k}, \quad t_i < t
+\end{equation}
+
+\subsection{Encoding}
+
+A temporal relational encoder produces embeddings:
+
+\begin{equation}
+h_i = f_\theta(x, t_i), \quad h_q = f_\theta(x, t)
+\end{equation}
+
+\subsection{Projection and Interface}
+
+To align with LLM input space, we introduce a projection layer:
+
+\begin{equation}
+z_i = W h_i, \quad z_q = W h_q
+\end{equation}
+
+\subsection{ICL Sequence Construction}
+
+The LLM receives:
+
+\begin{equation}
+[(z_i, y_i)]_{i=1}^{k}, \quad z_q
+\end{equation}
+
+and predicts:
+
+\begin{equation}
+\hat{y} = \text{LLM}(\text{Prompt}, \text{Sequence})
+\end{equation}
+
+\section{Training Strategy}
+
+\subsection{Frozen LLM}
+
+The LLM is kept fixed. Only the encoder $f_\theta$ and projection $W$ are trained.
+
+\subsection{Multi-Task, Multi-Dataset Training}
+
+Training batches mix:
+\begin{itemize}
+\item multiple datasets
+\item multiple tasks
+\item diverse $(x,t)$ samples without repetition per epoch
+\end{itemize}
+
+This enforces task-agnostic representation learning.
+
+\subsection{Objective Function}
+
+Primary loss:
+\begin{equation}
+\mathcal{L}_{LLM} = \ell(\hat{y}, y)
+\end{equation}
+
+Auxiliary loss (optional but recommended):
+\begin{equation}
+\mathcal{L}_{aux} = \ell(g(h_q), y)
+\end{equation}
+
+Final objective:
+\begin{equation}
+\mathcal{L} = \mathcal{L}_{LLM} + \lambda \mathcal{L}_{aux}
+\end{equation}
+
+\section{Embedding--LLM Interface as an Alignment Problem}
+
+A central challenge is aligning encoder outputs with LLM input expectations.
+
+\subsection{Types of Misalignment}
+
+\begin{itemize}
+\item \textbf{Dimensional Alignment:} $h \in \mathbb{R}^d$ vs token embeddings in $\mathbb{R}^{d_{LLM}}$
+\item \textbf{Distributional Alignment:} encoder outputs do not follow token embedding distribution
+\item \textbf{Semantic Alignment:} embeddings lack inherent meaning in LLM space
+\end{itemize}
+
+\subsection{Implications}
+
+Even with projection $W$, the LLM receives vectors that do not correspond to meaningful tokens. Therefore, the encoder must learn representations that are \textbf{interpretable under the fixed LLM}.
+
+\subsection{Design Principle}
+
+We define the goal as learning:
+\begin{equation}
+h = f_\theta(x,t)
+\end{equation}
+such that:
+\begin{equation}
+\text{LLM}(\text{format}(h, \mathcal{C})) \rightarrow y
+\end{equation}
+
+\section{Design Choices and Alternatives}
+
+\subsection{Encoder Choices}
+
+\begin{center}
+\begin{tabular}{lcc}
+\toprule
+Encoder & Pros & Cons \\
+\midrule
+TGAT & Efficient, simple & Limited memory \\
+Graph Transformer & Expressive & High cost \\
+TGN & Temporal memory & Complex \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{Context Construction Strategies}
+
+\begin{itemize}
+\item Full history (expensive)
+\item Recent-$k$ history (efficient)
+\item Graph-aware sampling (informative but costly)
+\item Hybrid (recommended)
+\end{itemize}
+
+\subsection{Embedding Interface Strategies}
+
+\begin{itemize}
+\item Text serialization (simple, weak)
+\item Linear projection (recommended baseline)
+\item Discretization (token-like but lossy)
+\item Cross-attention adapter (powerful but intrusive)
+\end{itemize}
+
+\section{Advantages}
+
+\begin{itemize}
+\item \textbf{Task Generalization:} single encoder across tasks
+\item \textbf{Modularity:} decouples encoder and reasoning
+\item \textbf{Temporal Reasoning:} naturally incorporates history
+\item \textbf{Future Compatibility:} enables plug-and-play with future LLMs
+\end{itemize}
+
+\section{Limitations and Risks}
+
+\begin{itemize}
+\item \textbf{Alignment Difficulty:} embeddings may not align with LLM expectations
+\item \textbf{Weak Gradient Signal:} supervision passes through frozen LLM
+\item \textbf{Sampling Bottleneck:} dynamic context construction is expensive
+\item \textbf{Context Sensitivity:} performance depends on example selection
+\item \textbf{LLM Bias:} encoder may overfit to current LLM behavior
+\end{itemize}
+
+\section{Design for Future LLM Compatibility}
+
+To ensure compatibility with future LLMs, we propose:
+
+\begin{itemize}
+\item separating representation $h$ from interface $z$
+\item enforcing intrinsic structure via auxiliary losses
+\item using structured prompts for stability
+\item optionally training with multiple LLMs
+\end{itemize}
+
+The goal is to learn \textbf{interface-stable representations} that generalize across models.
+
+\section{Evaluation Plan}
+
+\subsection{Baselines}
+\begin{itemize}
+\item TGNN + MLP
+\item RDBLearn
+\item TabPFN
+\end{itemize}
+
+\subsection{Metrics}
+\begin{itemize}
+\item predictive performance (MAE, AUC, MRR)
+\item inference latency
+\item sampling overhead
+\end{itemize}
+
+\subsection{Ablations}
+\begin{itemize}
+\item with/without history
+\item random vs structured sampling
+\item projection vs no projection
+\item auxiliary loss vs none
+\end{itemize}
+
+\section{Conclusion}
+
+We introduce a new paradigm for relational learning:
+
+\begin{quote}
+\textit{Train relational encoders not for direct prediction, but for compatibility with in-context reasoning in frozen LLMs.}
+\end{quote}
+
+This approach opens a path toward relational foundation models that are modular, generalizable, and future-proof.
+
+\bibliographystyle{plain}
+\bibliography{refs}
+
+\end{document}
