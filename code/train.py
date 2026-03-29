@@ -72,7 +72,7 @@ def main() -> None:
         print(f"  outputs={batch['output']}")
         print(f"  first_train_item={batch['train_item'][0]}")
         print(f"  first_history={batch_history[0]}")
-        breakpoint()
+        # breakpoint()
 
 
 if __name__ == "__main__":

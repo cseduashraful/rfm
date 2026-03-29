@@ -38,10 +38,10 @@ class TaskResource:
     task_object: Any
     db: Database
     task_frame_time_values: torch.Tensor
+    task_schedule_timestamps: torch.Tensor
     label_horizon_ns: int
     entity_to_row_indices: dict[Any, torch.Tensor]
     entity_to_time_values: dict[Any, torch.Tensor]
-    entity_to_dataset_times: dict[Any, torch.Tensor]
 
 
 class MixedTaskTrainDataset(Dataset):
@@ -152,12 +152,6 @@ def build_task_resource(
     if entity_table is None:
         raise ValueError(f"Task {task} is not currently supported because entity_table is missing.")
 
-    entity_to_dataset_times = build_entity_dataset_time_index(
-        db=db,
-        entity_col=entity_col,
-        entity_table=entity_table,
-    )
-
     return TaskResource(
         dataset=dataset_name,
         task=task_name,
@@ -173,53 +167,11 @@ def build_task_resource(
         task_object=task,
         db=db,
         task_frame_time_values=time_values,
+        task_schedule_timestamps=torch.unique_consecutive(time_values),
         label_horizon_ns=int(task.timedelta.value),
         entity_to_row_indices=entity_to_row_indices,
         entity_to_time_values=entity_to_time_values,
-        entity_to_dataset_times=entity_to_dataset_times,
     )
-
-
-def build_entity_dataset_time_index(
-    db: Database,
-    entity_col: str,
-    entity_table: str,
-) -> dict[Any, torch.Tensor]:
-    entity_to_times: dict[Any, list[int]] = {}
-
-    for table_name, table in db.table_dict.items():
-        if table.time_col is None:
-            continue
-
-        candidate_cols: list[str] = []
-        if table_name == entity_table and table.pkey_col == entity_col:
-            candidate_cols.append(entity_col)
-
-        for fkey_col, pkey_table_name in table.fkey_col_to_pkey_table.items():
-            if pkey_table_name == entity_table:
-                candidate_cols.append(fkey_col)
-
-        if not candidate_cols:
-            continue
-
-        time_ns = table.df[table.time_col].astype("int64")
-        for candidate_col in candidate_cols:
-            pairs = pd.DataFrame(
-                {
-                    "entity": table.df[candidate_col],
-                    "time_ns": time_ns,
-                }
-            ).dropna(subset=["entity", "time_ns"])
-
-            grouped = pairs.groupby("entity", sort=False)["time_ns"]
-            for entity_value, values in grouped:
-                entity_to_times.setdefault(entity_value, []).extend(values.tolist())
-
-    output: dict[Any, torch.Tensor] = {}
-    for entity_value, values in entity_to_times.items():
-        unique_sorted = sorted(set(int(v) for v in values))
-        output[entity_value] = torch.tensor(unique_sorted, dtype=torch.long)
-    return output
 
 
 def build_examples_and_resources(
@@ -313,40 +265,6 @@ def sample_history_for_example(
     return history
 
 
-def sample_dataset_history_timestamps_for_example(
-    resource: TaskResource,
-    row_index: int,
-) -> torch.Tensor:
-    if resource.history_length <= 0:
-        return torch.empty(0, dtype=torch.long)
-    if resource.history_sampling_strategy != "random_prior":
-        raise ValueError(
-            f"Unsupported history sampling strategy: {resource.history_sampling_strategy}"
-        )
-
-    row = resource.frame.iloc[row_index]
-    entity_value = row[resource.entity_col]
-    candidate_times = resource.entity_to_dataset_times.get(entity_value)
-    if candidate_times is None or candidate_times.numel() == 0:
-        return torch.empty(0, dtype=torch.long)
-
-    current_time_value = torch.tensor(
-        int(pd.Timestamp(row[resource.time_col]).value),
-        dtype=torch.long,
-    )
-    effective_cutoff = current_time_value - resource.label_horizon_ns
-    cutoff = int(torch.searchsorted(candidate_times, effective_cutoff, right=True).item())
-    prior_times = candidate_times[:cutoff]
-    if prior_times.numel() == 0:
-        return torch.empty(0, dtype=torch.long)
-
-    sample_size = min(resource.history_length, int(prior_times.numel()))
-    permutation = torch.randperm(prior_times.numel())[:sample_size]
-    chosen = prior_times[permutation]
-    order = torch.argsort(chosen)
-    return chosen[order]
-
-
 def build_task_table_history_for_batch(
     batch: dict[str, list[Any]],
     task_resources: dict[tuple[str, str], TaskResource],
@@ -366,7 +284,7 @@ def build_dataset_history_for_batch(
     batch: dict[str, list[Any]],
     task_resources: dict[tuple[str, str], TaskResource],
 ) -> list[list[dict[str, Any]]]:
-    sampled_times_per_example: list[tuple[TaskResource, Any, torch.Tensor]] = []
+    example_requests: list[tuple[TaskResource, Any, int]] = []
     grouped_timestamps: dict[tuple[str, str], set[int]] = {}
 
     for dataset_name, task_name, row_index in zip(
@@ -377,10 +295,19 @@ def build_dataset_history_for_batch(
         resource = task_resources[(dataset_name, task_name)]
         row = resource.frame.iloc[row_index]
         entity_value = row[resource.entity_col]
-        sampled_times = sample_dataset_history_timestamps_for_example(resource, row_index)
-        sampled_times_per_example.append((resource, entity_value, sampled_times))
+        current_time_value = int(pd.Timestamp(row[resource.time_col]).value)
+        effective_cutoff = current_time_value - resource.label_horizon_ns
+        cutoff = int(
+            torch.searchsorted(
+                resource.task_schedule_timestamps,
+                torch.tensor(effective_cutoff, dtype=torch.long),
+                right=True,
+            ).item()
+        )
+        prior_schedule = resource.task_schedule_timestamps[:cutoff]
+        example_requests.append((resource, entity_value, current_time_value))
         grouped_timestamps.setdefault((dataset_name, task_name), set()).update(
-            int(x) for x in sampled_times.tolist()
+            int(x) for x in prior_schedule.tolist()
         )
 
     label_lookup_per_task: dict[tuple[str, str], dict[tuple[Any, int], dict[str, Any]]] = {}
@@ -404,13 +331,33 @@ def build_dataset_history_for_batch(
         label_lookup_per_task[key] = label_lookup
 
     histories: list[list[dict[str, Any]]] = []
-    for resource, entity_value, sampled_times in sampled_times_per_example:
+    for resource, entity_value, current_time_value in example_requests:
         label_lookup = label_lookup_per_task[(resource.dataset, resource.task)]
-        history: list[dict[str, Any]] = []
-        for time_value in sampled_times.tolist():
-            record = label_lookup.get((entity_value, int(time_value)))
-            if record is None:
+        candidate_records: list[dict[str, Any]] = []
+        for (candidate_entity, candidate_time), record in label_lookup.items():
+            if candidate_entity != entity_value:
                 continue
+            if candidate_time + resource.label_horizon_ns > current_time_value:
+                continue
+            candidate_records.append(record)
+
+        if not candidate_records:
+            histories.append([])
+            continue
+
+        if resource.history_sampling_strategy != "random_prior":
+            raise ValueError(
+                f"Unsupported history sampling strategy: {resource.history_sampling_strategy}"
+            )
+
+        candidate_records.sort(key=lambda record: record[resource.time_col])
+        sample_size = min(resource.history_length, len(candidate_records))
+        permutation = torch.randperm(len(candidate_records))[:sample_size].tolist()
+        sampled_records = [candidate_records[index] for index in permutation]
+        sampled_records.sort(key=lambda record: record[resource.time_col])
+
+        history: list[dict[str, Any]] = []
+        for record in sampled_records:
             history.append(
                 {
                     "x": record[resource.entity_col],
