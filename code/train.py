@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
+import time
 
 from load_train_config import DEFAULT_CONFIG_PATH, load_config, validate_config
 from train_data import (
-    build_train_loader_with_resources,
     construct_batch_history,
+    load_preprocessed_train_data,
     summarize_examples,
 )
 
@@ -22,16 +23,6 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"Path to a Python train config file. Default: {DEFAULT_CONFIG_PATH}",
     )
     parser.add_argument(
-        "--no-dataset-download",
-        action="store_true",
-        help="Use existing dataset cache only and skip RelBench verification/download.",
-    )
-    parser.add_argument(
-        "--no-task-download",
-        action="store_true",
-        help="Use existing task cache only and skip RelBench verification/download.",
-    )
-    parser.add_argument(
         "--num-workers",
         type=int,
         default=0,
@@ -43,6 +34,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=1,
         help="Number of batches to print for inspection.",
     )
+    parser.add_argument(
+        "--epochs",
+        type=int,
+        default=10,
+        help="Number of epochs to iterate over the train loader.",
+    )
     return parser
 
 
@@ -51,28 +48,32 @@ def main() -> None:
     config = load_config(args.config.resolve())
     validate_config(config)
 
-    loader, task_resources, examples = build_train_loader_with_resources(
+    loader, task_resources, examples = load_preprocessed_train_data(
         config,
-        no_dataset_download=args.no_dataset_download,
-        no_task_download=args.no_task_download,
         num_workers=args.num_workers,
     )
     summarize_examples(examples)
 
-    for batch_index, batch in enumerate(loader):
-        if batch_index >= args.preview_batches:
-            break
-        batch_history = construct_batch_history(batch, task_resources)
-        print(f"batch_index={batch_index}")
-        print(f"  batch_size={len(batch['dataset'])}")
-        print(f"  datasets={batch['dataset']}")
-        print(f"  tasks={batch['task']}")
-        print(f"  row_indices={batch['row_index']}")
-        print(f"  timestamps={batch['timestamp']}")
-        print(f"  outputs={batch['output']}")
-        print(f"  first_train_item={batch['train_item'][0]}")
-        print(f"  first_history={batch_history[0]}")
-        # breakpoint()
+    for epoch in range(args.epochs):
+        epoch_start = time.perf_counter()
+        num_batches = 0
+
+        for batch_index, batch in enumerate(loader):
+            batch_history = construct_batch_history(batch, task_resources)
+            # if epoch == 0 and batch_index < args.preview_batches:
+            #     print(f"epoch={epoch + 1} batch_index={batch_index}")
+            #     print(f"  first_train_item={batch['train_item'][0]}")
+            #     print(f"  first_history={len(batch_history[0])}")
+            
+            print(f"epoch={epoch + 1} batch_index={batch_index}")
+            print(f"  first_train_item={batch['train_item'][0]}")
+            print(f"  first_history={len(batch_history[0])}")
+            num_batches += 1
+            if batch_index >= 10:
+                break
+
+        epoch_time = time.perf_counter() - epoch_start
+        print(f"epoch={epoch + 1} num_batches={num_batches} time_sec={epoch_time:.2f}")
 
 
 if __name__ == "__main__":

@@ -39,6 +39,18 @@ def validate_config(config: dict) -> None:
         raise ValueError("TRAIN_CONFIG must contain 'history_source'.")
     if config["history_source"] not in {"task_table", "dataset"}:
         raise ValueError("TRAIN_CONFIG['history_source'] must be 'task_table' or 'dataset'.")
+    if "history_parallel_mode" not in config:
+        raise ValueError("TRAIN_CONFIG must contain 'history_parallel_mode'.")
+    if config["history_parallel_mode"] not in {"grouped_vectorized", "multiprocess"}:
+        raise ValueError(
+            "TRAIN_CONFIG['history_parallel_mode'] must be 'grouped_vectorized' or 'multiprocess'."
+        )
+    if "history_parallel_workers" not in config:
+        raise ValueError("TRAIN_CONFIG must contain 'history_parallel_workers'.")
+    if "cache_dataset_history_labels" not in config:
+        raise ValueError("TRAIN_CONFIG must contain 'cache_dataset_history_labels'.")
+    if "cache_train_history_candidates" not in config:
+        raise ValueError("TRAIN_CONFIG must contain 'cache_train_history_candidates'.")
     if "datasets" not in config or not isinstance(config["datasets"], list):
         raise ValueError("TRAIN_CONFIG must contain a 'datasets' list.")
 

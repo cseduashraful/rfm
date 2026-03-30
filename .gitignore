@@ -18,6 +18,7 @@ venv/
 
 # Local artifacts
 artifacts/
+# Includes preprocessed train data under artifacts/preprocessed_train/
 
 # LaTeX build outputs
 *.aux

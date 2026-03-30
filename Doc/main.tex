@@ -219,6 +219,105 @@ To ensure compatibility with future LLMs, we propose:
 
 The goal is to learn \textbf{interface-stable representations} that generalize across models.
 
+\section{Implementation}
+
+\subsection{Repository Structure}
+
+The current codebase separates preprocessing, training-time loading, and analysis utilities:
+\begin{itemize}
+\item \texttt{code/data\_cli.py}: inspect RelBench datasets through DuckDB
+\item \texttt{code/preprocess\_train.py}: materialize train data and save reusable history artifacts
+\item \texttt{code/train\_data.py}: core train-data utilities, history construction, and cache loading
+\item \texttt{code/train.py}: thin runtime entrypoint for iterating over preprocessed batches
+\item \texttt{code/configs/train\_config.py}: experiment configuration
+\end{itemize}
+
+\textbf{Pros:} clear separation of responsibilities; expensive preprocessing can be reused across runs; training code stays small.\\
+\textbf{Cons:} more moving parts; preprocessing and runtime must remain schema-compatible.
+
+\subsection{Dataset and Task Loading}
+
+The implementation uses RelBench as the source of dataset and task definitions. Raw relational tables are materialized through the RelBench cache, while tasks are loaded through the task registry. DuckDB is used as a practical relational access layer for inspection and for compatibility with future non-RelBench datasets.
+
+\textbf{Pros:} reuses well-defined benchmark tasks; keeps access to the raw relational database; compatible with future extensions.\\
+\textbf{Cons:} some datasets/tasks are expensive to load; the implementation inherits RelBench task assumptions and timestamp schedules.
+
+\subsection{Preprocessing-First Training Pipeline}
+
+Rather than recomputing train histories inside every training iteration, the repository now uses an explicit preprocessing stage:
+\begin{enumerate}
+\item load each configured dataset and task
+\item materialize the task train table
+\item compute valid prior history candidates for each train datapoint
+\item save train tables, history candidate caches, and a manifest to disk
+\end{enumerate}
+
+At runtime, \texttt{train.py} only loads these preprocessed artifacts and constructs batches.
+
+\textbf{Pros:} much lower runtime overhead; reusable across epochs and runs; easier debugging of data issues.\\
+\textbf{Cons:} extra preprocessing step; cached data can become stale if task semantics or config change.
+
+\subsection{History Source Options}
+
+The code supports two history sources:
+\begin{itemize}
+\item \texttt{task\_table}: sample history from earlier rows already present in the task train table
+\item \texttt{dataset}: build history from task-valid prior timestamps derived from the raw dataset and task definition
+\end{itemize}
+
+\paragraph{Task-table history.}
+This mode samples earlier labeled rows directly from the train split of the task table.
+
+\textbf{Pros:} simple; fast; every sampled history item is already a valid labeled task example.\\
+\textbf{Cons:} sparse; limited to timestamps already materialized by the task; less suitable for large-context ICL.
+
+\paragraph{Dataset-based history.}
+This mode uses the task's natural train-time schedule, computes valid labels from the raw database, and then samples prior valid history candidates.
+
+\textbf{Pros:} more faithful to the intended relational/temporal setting; better suited for large history length $k$; more compatible with future ICL-style context construction.\\
+\textbf{Cons:} more expensive to preprocess; task validity constraints may make candidate construction nontrivial.
+
+\subsection{Caching Options}
+
+Two cache layers are implemented:
+\begin{itemize}
+\item \texttt{cache\_dataset\_history\_labels}: in-memory timestamp-level label cache for dataset-based history
+\item \texttt{cache\_train\_history\_candidates}: saved candidate-history pools for each train datapoint
+\end{itemize}
+
+The second cache is the main reusable cache for training. It stores compact history candidate references, not fully materialized sampled histories.
+
+\textbf{Pros:} reduces repeated task recomputation; reusable across batches, epochs, and later runs; compact relative to saving full histories.\\
+\textbf{Cons:} can still be large for dense tasks; requires cache invalidation discipline when configuration changes.
+
+\subsection{Parallel History Construction}
+
+At runtime, history construction can use one of two CPU strategies:
+\begin{itemize}
+\item \texttt{grouped\_vectorized}: group batch items by $(\text{dataset}, \text{task})$ and process them in a single process with lower Python overhead
+\item \texttt{multiprocess}: distribute grouped history construction across CPU worker processes
+\end{itemize}
+
+\textbf{Grouped/vectorized mode.}
+\textbf{Pros:} low overhead; good cache locality; often fastest for moderate batch sizes.\\
+\textbf{Cons:} still limited by single-process Python throughput.
+
+\textbf{Multiprocess mode.}
+\textbf{Pros:} exploits independent per-item history construction; may help for very large batches.\\
+\textbf{Cons:} process-management overhead; benefit depends on batch composition and memory-sharing behavior.
+
+\subsection{Current Limitations of the Implementation}
+
+The current repository stops at data preparation and mixed-batch construction. It does not yet implement:
+\begin{itemize}
+\item temporal graph encoders
+\item embedding generation for history items
+\item the LLM projection/interface module
+\item end-to-end optimization against the frozen LLM
+\end{itemize}
+
+Thus, the implementation should currently be viewed as a \textbf{data and training-example construction layer} for the larger RFM pipeline, not the full model stack.
+
 \section{Evaluation Plan}
 
 \subsection{Baselines}
