@@ -318,6 +318,256 @@ The current repository stops at data preparation and mixed-batch construction. I
 
 Thus, the implementation should currently be viewed as a \textbf{data and training-example construction layer} for the larger RFM pipeline, not the full model stack.
 
+\subsection{Current Zero-Shot Inference Implementation}
+
+The repository now also contains a zero-shot inference path under \texttt{code/zero\_shot.py}. Unlike the preprocessing-first training pipeline, this path constructs history and graph context online at inference time and directly queries a frozen local LLM.
+
+\paragraph{Main supporting files.}
+\begin{itemize}
+\item \texttt{code/zero\_shot.py}: runtime entrypoint, CLI, streaming, logging, and MAE computation
+\item \texttt{code/zero\_shot\_llm.py}: local LLM wrapper, model-path registry, and batched generation helper
+\item \texttt{code/inference\_history.py}: inference-time history construction, validation, and history samplers
+\item \texttt{code/grag.py}: GraphRAG store, temporal retrieval, optional semantic retrieval, and prompt builder
+\item \texttt{code/configs/inference\_config.py}: single-dataset, single-task inference configuration
+\end{itemize}
+
+\paragraph{High-level runtime.}
+For each evaluation query, the implementation now performs:
+\begin{enumerate}
+\item load the dataset and task through RelBench
+\item materialize a raw relational database for inference
+\item build a temporal GraphRAG index over the database
+\item construct task-valid prior history for the query entity
+\item retrieve $k$-hop graph neighborhoods under temporal cutoff constraints
+\item assemble a prompt for a local LLaMA model
+\item decode a scalar prediction
+\item compute MAE when labels are available
+\end{enumerate}
+
+\subsection{Inference Query Semantics}
+
+Each inference item is a task row with:
+\begin{itemize}
+\item entity identifier
+\item query timestamp
+\item optional target label
+\end{itemize}
+
+For a query:
+\begin{equation}
+(x,t) \rightarrow y
+\end{equation}
+
+the runtime first attempts to build a prior context:
+\begin{equation}
+\mathcal{C}_{hist} = \{(x,t_i,y_i)\}_{i=1}^{k}, \quad t_i < t
+\end{equation}
+
+When the history source is dataset-based, a stronger temporal validity rule is enforced:
+\begin{equation}
+t_i + \Delta_{task} \le t
+\end{equation}
+
+where $\Delta_{task}$ is the task horizon used to define the label window in RelBench. This prevents a history item's label from overlapping the final query's future interval.
+
+\subsection{Inference-Time History Construction}
+
+The current zero-shot implementation supports two sources of history:
+\begin{itemize}
+\item \texttt{task\_table}
+\item \texttt{dataset}
+\end{itemize}
+
+\paragraph{Task-table history.}
+Earlier labeled rows already present in the task table are sampled directly.
+
+\paragraph{Dataset-based history.}
+This is the more general current mode. For each query:
+\begin{enumerate}
+\item candidate timestamps are collected from raw tables with valid time columns
+\item only timestamps strictly before the query time are retained
+\item \texttt{task.make\_table(db, candidate\_timestamps)} is used to materialize task-valid rows
+\item the resulting rows are filtered to the same entity
+\item rows violating the non-overlap horizon constraint are removed
+\item duplicate rows on entity and timestamp are removed
+\item a history sampler chooses up to \texttt{history\_length} rows
+\end{enumerate}
+
+This design makes zero-shot history faithful to the task semantics rather than merely collecting arbitrary raw rows involving the entity.
+
+\subsection{History Sampling Strategies}
+
+Three history sampling strategies are currently implemented:
+\begin{itemize}
+\item \texttt{most\_recent\_k}
+\item \texttt{random\_prior}
+\item \texttt{recent\_min\_overlap}
+\end{itemize}
+
+\paragraph{Most recent $k$.}
+Select the most recent valid prior rows.
+
+\paragraph{Random prior.}
+Uniformly sample from valid prior rows.
+
+\paragraph{Recent min-overlap.}
+Prefer recent valid rows while trying to keep selected timestamps separated by at least one task horizon before filling remaining slots.
+
+The current default in the code is deterministic and does not require labels for tuning:
+\begin{equation}
+\texttt{history\_sampling\_strategy} = \texttt{most\_recent\_k}
+\end{equation}
+
+\subsection{GraphRAG Structure Used at Inference}
+
+The GraphRAG store built in \texttt{code/grag.py} contains:
+\begin{itemize}
+\item one node for each primary-key row in each table
+\item typed edges for FK$\rightarrow$PK relations
+\item reverse adjacency for backward traversal
+\item a task-entity history index
+\item static row references for non-temporal rows
+\end{itemize}
+
+Thus retrieval is not limited to one direction of the schema graph. It can traverse both explicit FK edges and their reverse counterparts while still enforcing temporal cutoffs.
+
+\subsection{Context Retrieved for Each Prompt Entry}
+
+For each prompt entrypoint, the current implementation constructs:
+\begin{itemize}
+\item static rows for the entity
+\item prior history rows before the entrypoint cutoff
+\item $k$-hop neighbors of history rows
+\item $k$-hop neighbors of the query entity node itself
+\item optional same-table similar-entity evidence when semantic retrieval is enabled
+\end{itemize}
+
+An important current design choice is that the query entity's own neighborhood is always considered. Therefore, even if the task-history list is empty, the runtime still attempts to retrieve the query node's own temporal relational neighborhood before the cutoff.
+
+\subsection{Temporal Safety of Retrieved Context}
+
+The present implementation attempts to maintain zero-shot temporal validity through the following rules:
+\begin{itemize}
+\item history rows must occur strictly before the query time
+\item dataset-derived history rows must satisfy the non-overlap horizon condition
+\item neighbor retrieval is cutoff-aware
+\item same-timestamp neighborhood edges may be included when they belong to the already-allowed row snapshot
+\end{itemize}
+
+This is intended to preserve the contemporaneous relational neighborhood of valid history rows while excluding truly future information.
+
+\subsection{Prompt Structure}
+
+The prompt assembled in \texttt{code/grag.py} currently contains:
+\begin{enumerate}
+\item task header
+\item strict instruction to return only a number
+\item one short explanation of what kinds of context are included
+\item static information block
+\item zero or more prior history examples with labels
+\item history and graph-neighborhood context for those examples
+\item the final unlabeled query block
+\item short direct prediction instruction
+\item \texttt{Answer:}
+\end{enumerate}
+
+The design goal is to simulate in-context learning for the same task and entity: prior history examples act as demonstrations, while the final query asks the LLM to infer the missing target.
+
+\subsection{Neighbor Rendering}
+
+All retrieved neighbors are currently included in the prompt. The implementation does not do prompt-side truncation beyond the retrieval limits already imposed by:
+\begin{itemize}
+\item \texttt{num\_hops}
+\item \texttt{top\_k}
+\end{itemize}
+
+Neighbors are rendered in a graph-aware style that tries to make the relation structure visible to the LLM rather than presenting them as an unstructured list of rows.
+
+\subsection{Optional Semantic Retrieval}
+
+The zero-shot CLI also exposes an optional retrieval mode beyond explicit PK/FK structure. When enabled, the system retrieves same-table semantically similar entities using generic static-attribute similarity. For each similar entity, the prompt may include:
+\begin{itemize}
+\item entity identity
+\item heuristic similarity score
+\item static summary
+\item pre-cutoff history rows
+\end{itemize}
+
+This path is disabled by default and is intended as a generic cold-start fallback rather than a task-specific learned module.
+
+\subsection{Local LLM Interface}
+
+The current inference runtime uses locally downloaded LLaMA checkpoints through Hugging Face \texttt{transformers}. The wrapper currently supports:
+\begin{itemize}
+\item \texttt{1b}
+\item \texttt{3b}
+\item \texttt{8b}
+\end{itemize}
+
+Generation is decoder-only, deterministic, and followed by numeric extraction from the returned text.
+
+\subsection{Two-Stage Runtime and Streaming}
+
+The runtime is structured as a two-stage system:
+\begin{enumerate}
+\item CPU-side context generation
+\item GPU-side LLM generation
+\end{enumerate}
+
+Prepared prompts are streamed to the LLM as soon as they become available. Thus the LLM does not need to wait for the entire context batch to finish if:
+\begin{itemize}
+\item prompt preparation is producing ready items
+\item the LLM batch size is small
+\end{itemize}
+
+\subsection{Batching and Parallelism}
+
+The current zero-shot implementation exposes:
+\begin{itemize}
+\item context-batch size
+\item LLM-batch size
+\item worker count for example-level prompt preparation
+\item worker count for frontier expansion inside multi-hop graph search
+\end{itemize}
+
+Parallelism currently exists at multiple levels:
+\begin{itemize}
+\item across examples in a context batch
+\item within prompt construction across entrypoints
+\item within a hop frontier during graph expansion
+\end{itemize}
+
+This may improve throughput, but excessive nested parallelism can also increase overhead and harm latency. Therefore, the current runtime should be viewed as an exploratory parallel implementation rather than a final optimized scheduler.
+
+\subsection{Evaluation}
+
+When labels are available, the runtime computes MAE:
+\begin{equation}
+\mathrm{MAE} = \frac{1}{N}\sum_{i=1}^{N} |\hat{y}_i - y_i|
+\end{equation}
+
+If labels are absent, predictions are still produced but MAE is skipped.
+
+\subsection{Current Limitations of the Zero-Shot Path}
+
+The present implementation remains expensive for several reasons:
+\begin{itemize}
+\item dataset-based history construction repeatedly materializes task-valid rows
+\item multi-hop graph retrieval can expand rapidly
+\item prompt size grows quickly when all neighbors are included
+\item semantic retrieval remains heuristic
+\item throughput and latency depend strongly on worker settings
+\end{itemize}
+
+Nevertheless, unlike the earlier training-only path, the current repository now includes a full end-to-end zero-shot inference stack:
+\begin{itemize}
+\item online history construction
+\item temporal GraphRAG retrieval
+\item prompt assembly
+\item local LLM generation
+\item metric computation
+\end{itemize}
+
 \section{Evaluation Plan}
 
 \subsection{Baselines}
