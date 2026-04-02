@@ -1,0 +1,1481 @@
+from dataclasses import dataclass, field
+from typing import Dict, List, Tuple, Optional, Any, Iterable
+from collections import defaultdict
+import datetime
+
+import numpy as np
+import pandas as pd
+
+
+@dataclass
+class RelBenchGraphRAGStore:
+    # ---------- ID maps ----------
+    node_id_map: Dict[Tuple[str, Any], int] = field(default_factory=dict)
+    rev_node_id: List[Tuple[str, Any]] = field(default_factory=list)
+
+    edge_type_map: Dict[Tuple[str, str, str], int] = field(default_factory=dict)
+    rev_edge_type: List[Tuple[str, str, str]] = field(default_factory=list)
+
+    # node_id -> list[row_id] where row has no time_col
+    static_info: Dict[int, List[int]] = field(default_factory=dict)
+
+    # ---------- Base history index ----------
+    hist_indptr: Optional[np.ndarray] = None
+    hist_rowid: Optional[np.ndarray] = None
+    hist_ts: Optional[np.ndarray] = None
+
+    # ---------- Base adjacency index ----------
+    indptr: Optional[np.ndarray] = None
+    dst: Optional[np.ndarray] = None
+    ts: Optional[np.ndarray] = None
+    etype: Optional[np.ndarray] = None
+    rowid: Optional[np.ndarray] = None
+
+    # reverse adjacency
+    rev_indptr: Optional[np.ndarray] = None
+    rev_src: Optional[np.ndarray] = None
+    rev_ts: Optional[np.ndarray] = None
+    rev_etype: Optional[np.ndarray] = None
+    rev_rowid: Optional[np.ndarray] = None
+
+    # ---------- Row store ----------
+    row_table: List[str] = field(default_factory=list)
+    row_pk: List[Any] = field(default_factory=list)
+    row_time: List[Any] = field(default_factory=list)
+    node_rowid_map: Dict[int, int] = field(default_factory=dict)
+
+    # ---------- Delta overlay ----------
+    delta_hist: Dict[int, List[Tuple[Any, int]]] = field(default_factory=dict)
+    delta_adj: Dict[int, List[Tuple[int, Any, int, int]]] = field(default_factory=dict)
+
+    # ---------- Basic metadata ----------
+    num_nodes: int = 0
+    num_edges: int = 0
+    num_rows: int = 0
+
+    # ---------- Performance ----------
+    # exact-query caches
+    neighbor_cache: Dict[Tuple[int, int, int, Optional[Tuple[int, ...]]], List[Dict[str, Any]]] = field(default_factory=dict)
+    multihop_cache: Dict[Tuple[int, int, int, int], List[Dict[str, Any]]] = field(default_factory=dict)
+    history_cache: Dict[Tuple[int, int, int], List[Dict[str, Any]]] = field(default_factory=dict)
+
+    # node_id -> cached adjacency slice metadata
+    _neighbor_slice_cache: Dict[int, Dict[str, Any]] = field(default_factory=dict)
+
+    # table_name -> list[node_id]
+    nodes_by_table: Dict[str, List[int]] = field(default_factory=dict)
+
+    # time offset
+    edge_time_offset: int = 0
+
+    # tuneables
+    # how many candidates per direction to inspect before final top-k merge
+    neighbor_scan_factor: int = 8
+    neighbor_min_scan: int = 64
+    max_multihop_nodes_per_hop: int = 512
+    max_similarity_scan_per_table: Optional[int] = 5000
+
+    def add_delta_rows(self, table_name: str, df_chunk) -> None:
+        raise NotImplementedError
+
+    def clear_caches(self) -> None:
+        self.neighbor_cache.clear()
+        self.multihop_cache.clear()
+        self.history_cache.clear()
+        self._neighbor_slice_cache.clear()
+
+    def _get_or_create_node_id(self, key: Tuple[str, Any]) -> int:
+        nid = self.node_id_map.get(key)
+        if nid is not None:
+            return nid
+        nid = len(self.rev_node_id)
+        self.node_id_map[key] = nid
+        self.rev_node_id.append(key)
+        self.num_nodes = len(self.rev_node_id)
+        return nid
+
+    def _get_or_create_edge_type(self, key: Tuple[str, str, str]) -> int:
+        eid = self.edge_type_map.get(key)
+        if eid is not None:
+            return eid
+        eid = len(self.rev_edge_type)
+        self.edge_type_map[key] = eid
+        self.rev_edge_type.append(key)
+        return eid
+
+    @staticmethod
+    def _cutoff_to_int(cutoff_time) -> int:
+        if cutoff_time is None:
+            return np.iinfo(np.int64).max
+        if isinstance(cutoff_time, (int, np.integer)):
+            return int(cutoff_time)
+        if isinstance(cutoff_time, pd.Timestamp):
+            return int(cutoff_time.value)
+        if hasattr(cutoff_time, "value"):
+            return int(cutoff_time.value)
+        raise TypeError(f"Unsupported cutoff_time type: {type(cutoff_time)}")
+
+    @staticmethod
+    def _timestamp_to_ns(ts) -> int:
+        if ts is None:
+            return 0
+        if isinstance(ts, (int, np.integer)):
+            return int(ts)
+        if isinstance(ts, pd.Timestamp):
+            return int(ts.value)
+        if hasattr(ts, "value"):
+            return int(ts.value)
+        raise TypeError(f"Unsupported timestamp type: {type(ts)}")
+
+    def build_base(self, db, task=None) -> None:
+        self.clear_caches()
+        self.node_id_map.clear()
+        self.rev_node_id.clear()
+        self.edge_type_map.clear()
+        self.rev_edge_type.clear()
+        self.static_info.clear()
+        self.row_table.clear()
+        self.row_pk.clear()
+        self.row_time.clear()
+        self.node_rowid_map.clear()
+        self.nodes_by_table.clear()
+
+        row_id = 0
+        self.table_row_offset = {}
+        offset = 0
+
+        # ---------- pass 1: create nodes + row metadata ----------
+        for table_name, table in db.table_dict.items():
+            df = table.df
+            self.table_row_offset[table_name] = offset
+            offset += len(df)
+
+            pk_col = table.pkey_col
+            time_col = table.time_col
+            col_idx = {col: idx for idx, col in enumerate(df.columns)}
+            pk_idx = col_idx[pk_col]
+            time_idx = col_idx[time_col] if time_col is not None else None
+
+            row_table_append = self.row_table.append
+            row_pk_append = self.row_pk.append
+            row_time_append = self.row_time.append
+            get_or_create_node_id = self._get_or_create_node_id
+
+            for row in df.itertuples(index=False, name=None):
+                pk_val = row[pk_idx]
+                node_key = (table_name, pk_val)
+                nid = get_or_create_node_id(node_key)
+                self.nodes_by_table.setdefault(table_name, []).append(nid)
+
+                row_table_append(table_name)
+                row_pk_append(pk_val)
+                row_time_append(row[time_idx] if time_idx is not None else None)
+                self.node_rowid_map[nid] = row_id
+                row_id += 1
+
+        self.num_rows = row_id
+
+        # ---------- pass 2: build edges ----------
+        src_list = []
+        dst_list = []
+        ts_list = []
+        etype_list = []
+        rowid_list = []
+
+        row_id = 0
+        node_id_map = self.node_id_map
+
+        for table_name, table in db.table_dict.items():
+            df = table.df
+            pk_col = table.pkey_col
+            time_col = table.time_col
+            fks = table.fkey_col_to_pkey_table
+
+            col_idx = {col: idx for idx, col in enumerate(df.columns)}
+            pk_idx = col_idx[pk_col]
+            time_idx = col_idx[time_col] if time_col is not None else None
+
+            fk_info = []
+            for fk_col, ref_table in fks.items():
+                if fk_col not in col_idx:
+                    continue
+                fk_info.append(
+                    (
+                        col_idx[fk_col],
+                        ref_table,
+                        self._get_or_create_edge_type((table_name, fk_col, ref_table)),
+                    )
+                )
+
+            src_append = src_list.append
+            dst_append = dst_list.append
+            ts_append = ts_list.append
+            etype_append = etype_list.append
+            rowid_append = rowid_list.append
+
+            for row in df.itertuples(index=False, name=None):
+                pk_val = row[pk_idx]
+                src_node = node_id_map[(table_name, pk_val)]
+
+                if time_idx is not None:
+                    tsv = row[time_idx]
+                    ts_ns = 0 if tsv is None else int(tsv.value)
+                else:
+                    ts_ns = 0
+
+                for fk_idx, ref_table, et in fk_info:
+                    ref_val = row[fk_idx]
+                    if ref_val is None:
+                        continue
+                    dst_node = node_id_map.get((ref_table, ref_val))
+                    if dst_node is None:
+                        continue
+
+                    src_append(src_node)
+                    dst_append(dst_node)
+                    ts_append(ts_ns)
+                    etype_append(et)
+                    rowid_append(row_id)
+
+                row_id += 1
+
+        self.src = np.asarray(src_list, dtype=np.int32)
+        self.dst = np.asarray(dst_list, dtype=np.int32)
+        ts_arr = np.asarray(ts_list, dtype=np.int64)
+        self.edge_time_offset = int(ts_arr.min()) if len(ts_arr) > 0 else 0
+        if len(ts_arr) > 0:
+            ts_arr = ts_arr - self.edge_time_offset
+        self.ts = ts_arr
+        self.etype = np.asarray(etype_list, dtype=np.int16)
+        self.rowid = np.asarray(rowid_list, dtype=np.int32)
+
+        self.num_edges = len(self.src)
+        self._build_csr_from_edges()
+        self._build_history_index(db, task)
+
+    def _build_csr_from_edges(self) -> None:
+        if self.num_edges == 0:
+            self.indptr = np.zeros(self.num_nodes + 1, dtype=np.int64)
+            self.rev_indptr = np.zeros(self.num_nodes + 1, dtype=np.int64)
+            self.rev_src = np.zeros(0, dtype=np.int32)
+            self.rev_dst = np.zeros(0, dtype=np.int32)
+            self.rev_ts = np.zeros(0, dtype=np.int64)
+            self.rev_etype = np.zeros(0, dtype=np.int16)
+            self.rev_rowid = np.zeros(0, dtype=np.int32)
+            return
+
+        # forward: sort by (src, ts)
+        order = np.lexsort((self.ts, self.src))
+        self.src = self.src[order]
+        self.dst = self.dst[order]
+        self.ts = self.ts[order]
+        self.etype = self.etype[order]
+        self.rowid = self.rowid[order]
+
+        counts = np.bincount(self.src, minlength=self.num_nodes)
+        self.indptr = np.empty(self.num_nodes + 1, dtype=np.int64)
+        self.indptr[0] = 0
+        np.cumsum(counts, out=self.indptr[1:])
+
+        # reverse: sort by (dst, ts)
+        rev_order = np.lexsort((self.ts, self.dst))
+        self.rev_dst = self.dst[rev_order]
+        self.rev_src = self.src[rev_order]
+        self.rev_ts = self.ts[rev_order]
+        self.rev_etype = self.etype[rev_order]
+        self.rev_rowid = self.rowid[rev_order]
+
+        rev_counts = np.bincount(self.rev_dst, minlength=self.num_nodes)
+        self.rev_indptr = np.empty(self.num_nodes + 1, dtype=np.int64)
+        self.rev_indptr[0] = 0
+        np.cumsum(rev_counts, out=self.rev_indptr[1:])
+
+    def _build_history_index(self, db, task) -> None:
+        if task is None:
+            self.hist_indptr = np.zeros(self.num_nodes + 1, dtype=np.int64)
+            self.hist_rowid = np.zeros(0, dtype=np.int32)
+            self.hist_ts = np.zeros(0, dtype=np.int64)
+            return
+
+        entity_col = task.entity_col
+        entity_table = task.entity_table
+
+        src_nodes = []
+        row_ids = []
+        ts_list = []
+
+        row_id = 0
+        for table_name, table in db.table_dict.items():
+            df = table.df
+
+            if entity_col not in df.columns:
+                row_id += len(df)
+                continue
+
+            time_col = table.time_col
+            col_idx = {col: idx for idx, col in enumerate(df.columns)}
+            ent_idx = col_idx[entity_col]
+            time_idx = col_idx[time_col] if time_col is not None else None
+
+            for row in df.itertuples(index=False, name=None):
+                ent_val = row[ent_idx]
+                node = self.node_id_map.get((entity_table, ent_val))
+                if node is None:
+                    row_id += 1
+                    continue
+
+                if time_idx is None:
+                    self.static_info.setdefault(node, []).append(row_id)
+                else:
+                    tsv = row[time_idx]
+                    if tsv is None:
+                        row_id += 1
+                        continue
+                    src_nodes.append(node)
+                    row_ids.append(row_id)
+                    ts_list.append(int(tsv.value))
+
+                row_id += 1
+
+        if len(src_nodes) == 0:
+            self.hist_indptr = np.zeros(self.num_nodes + 1, dtype=np.int64)
+            self.hist_rowid = np.zeros(0, dtype=np.int32)
+            self.hist_ts = np.zeros(0, dtype=np.int64)
+            return
+
+        src_nodes = np.asarray(src_nodes, dtype=np.int32)
+        row_ids = np.asarray(row_ids, dtype=np.int32)
+        ts_arr = np.asarray(ts_list, dtype=np.int64)
+
+        order = np.lexsort((ts_arr, src_nodes))
+        src_nodes = src_nodes[order]
+        row_ids = row_ids[order]
+        ts_arr = ts_arr[order]
+
+        counts = np.bincount(src_nodes, minlength=self.num_nodes)
+        self.hist_indptr = np.empty(self.num_nodes + 1, dtype=np.int64)
+        self.hist_indptr[0] = 0
+        np.cumsum(counts, out=self.hist_indptr[1:])
+
+        self.hist_rowid = row_ids
+        self.hist_ts = ts_arr
+
+    def get_static_info(self, node_id: int) -> List[int]:
+        return self.static_info.get(node_id, [])
+
+    def decode_row(self, row_id: int) -> Dict[str, Any]:
+        return {
+            "table": self.row_table[row_id],
+            "pk": self.row_pk[row_id],
+            "time": self.row_time[row_id],
+        }
+
+    def debug_neighbors(self, node_id: int, limit: int = 10):
+        start = self.indptr[node_id]
+        end = self.indptr[node_id + 1]
+        out = []
+        for i in range(start, min(end, start + limit)):
+            out.append(
+                {
+                    "src": int(self.src[i]),
+                    "dst": int(self.dst[i]),
+                    "ts": int(self.ts[i]) + self.edge_time_offset,
+                    "etype": int(self.etype[i]),
+                    "rowid": int(self.rowid[i]),
+                }
+            )
+        return out
+
+    def debug_history(self, node_id: int, limit: int = 10):
+        start = self.hist_indptr[node_id]
+        end = self.hist_indptr[node_id + 1]
+        out = []
+        for i in range(start, min(end, start + limit)):
+            out.append(
+                {
+                    "rowid": int(self.hist_rowid[i]),
+                    "ts": int(self.hist_ts[i]),
+                }
+            )
+        return out
+
+    def get_history_before(self, node_id: int, cutoff_time, k: int):
+        cutoff_abs = self._cutoff_to_int(cutoff_time)
+        cache_key = (node_id, cutoff_abs, k)
+        cached = self.history_cache.get(cache_key)
+        if cached is not None:
+            return [dict(x) for x in cached]
+
+        start = self.hist_indptr[node_id]
+        end = self.hist_indptr[node_id + 1]
+        if start == end:
+            return []
+
+        ts_slice = self.hist_ts[start:end]
+        pos = np.searchsorted(ts_slice, cutoff_abs, side="left")
+        if pos == 0:
+            return []
+
+        left = max(0, pos - k)
+        idx = np.arange(pos - 1, left - 1, -1, dtype=np.int64)
+        rowids = self.hist_rowid[start:end][idx]
+        tss = ts_slice[idx]
+
+        results = [
+            {"rowid": int(rid), "ts": int(ts)}
+            for rid, ts in zip(rowids, tss)
+        ]
+        self.history_cache[cache_key] = [dict(x) for x in results]
+        return results
+
+    def _get_node_neighbor_slices(self, node_id: int) -> Dict[str, Any]:
+        cached = self._neighbor_slice_cache.get(node_id)
+        if cached is not None:
+            return cached
+
+        f_start = int(self.indptr[node_id])
+        f_end = int(self.indptr[node_id + 1])
+
+        r_start = int(self.rev_indptr[node_id])
+        r_end = int(self.rev_indptr[node_id + 1])
+
+        cached = {
+            "f_dst": self.dst[f_start:f_end],
+            "f_ts": self.ts[f_start:f_end],
+            "f_etype": self.etype[f_start:f_end],
+            "f_rowid": self.rowid[f_start:f_end],
+            "r_dst": self.rev_src[r_start:r_end],
+            "r_ts": self.rev_ts[r_start:r_end],
+            "r_etype": self.rev_etype[r_start:r_end],
+            "r_rowid": self.rev_rowid[r_start:r_end],
+        }
+        self._neighbor_slice_cache[node_id] = cached
+        return cached
+
+    def _collect_direction_candidates(
+        self,
+        dst_arr: np.ndarray,
+        ts_arr: np.ndarray,
+        etype_arr: np.ndarray,
+        rowid_arr: np.ndarray,
+        cutoff_rel: int,
+        k: int,
+        etype_filter_set: Optional[set],
+    ):
+        if len(ts_arr) == 0:
+            return np.empty(0, dtype=np.int32), np.empty(0, dtype=np.int64), np.empty(0, dtype=np.int16), np.empty(0, dtype=np.int32)
+
+        pos = int(np.searchsorted(ts_arr, cutoff_rel, side="right"))
+        if pos == 0:
+            return np.empty(0, dtype=np.int32), np.empty(0, dtype=np.int64), np.empty(0, dtype=np.int16), np.empty(0, dtype=np.int32)
+
+        scan_n = min(pos, max(self.neighbor_min_scan, self.neighbor_scan_factor * max(k, 1)))
+        sl = slice(pos - scan_n, pos)
+
+        cand_dst = dst_arr[sl]
+        cand_ts = ts_arr[sl]
+        cand_etype = etype_arr[sl]
+        cand_rowid = rowid_arr[sl]
+
+        if etype_filter_set is not None:
+            mask = np.isin(cand_etype, np.fromiter(etype_filter_set, dtype=np.int16))
+            cand_dst = cand_dst[mask]
+            cand_ts = cand_ts[mask]
+            cand_etype = cand_etype[mask]
+            cand_rowid = cand_rowid[mask]
+
+        if len(cand_ts) == 0:
+            return cand_dst, cand_ts, cand_etype, cand_rowid
+
+        # newest first
+        order = np.argsort(cand_ts)[::-1]
+        return cand_dst[order], cand_ts[order], cand_etype[order], cand_rowid[order]
+
+    def get_neighbors_before(
+        self,
+        node_id: int,
+        cutoff_time,
+        k: int,
+        etype_filter: Optional[List[int]] = None,
+    ):
+        cutoff_abs = self._cutoff_to_int(cutoff_time)
+        filter_key = None if etype_filter is None else tuple(sorted(int(x) for x in etype_filter))
+        cache_key = (node_id, cutoff_abs, k, filter_key)
+        cached = self.neighbor_cache.get(cache_key)
+        if cached is not None:
+            return [dict(x) for x in cached]
+
+        cutoff_rel = cutoff_abs - self.edge_time_offset
+        if cutoff_rel < 0:
+            cutoff_rel = 0
+
+        etype_filter_set = None if etype_filter is None else set(int(x) for x in etype_filter)
+        sl = self._get_node_neighbor_slices(node_id)
+
+        f_dst, f_ts, f_etype, f_rowid = self._collect_direction_candidates(
+            sl["f_dst"], sl["f_ts"], sl["f_etype"], sl["f_rowid"], cutoff_rel, k, etype_filter_set
+        )
+        r_dst, r_ts, r_etype, r_rowid = self._collect_direction_candidates(
+            sl["r_dst"], sl["r_ts"], sl["r_etype"], sl["r_rowid"], cutoff_rel, k, etype_filter_set
+        )
+
+        if len(f_ts) == 0 and len(r_ts) == 0:
+            self.neighbor_cache[cache_key] = []
+            return []
+
+        cand_dst = np.concatenate([f_dst, r_dst], axis=0)
+        cand_ts = np.concatenate([f_ts, r_ts], axis=0)
+        cand_etype = np.concatenate([f_etype, r_etype], axis=0)
+        cand_rowid = np.concatenate([f_rowid, r_rowid], axis=0)
+
+        if len(cand_ts) == 0:
+            self.neighbor_cache[cache_key] = []
+            return []
+
+        order = np.argsort(cand_ts)[::-1]
+        cand_dst = cand_dst[order]
+        cand_ts = cand_ts[order]
+        cand_etype = cand_etype[order]
+        cand_rowid = cand_rowid[order]
+
+        results = []
+        seen = set()
+
+        for dst_i, ts_i, et_i, rid_i in zip(cand_dst, cand_ts, cand_etype, cand_rowid):
+            key = (int(dst_i), int(ts_i), int(et_i), int(rid_i))
+            if key in seen:
+                continue
+            seen.add(key)
+
+            results.append(
+                {
+                    "dst": int(dst_i),
+                    "ts": int(ts_i) + self.edge_time_offset,
+                    "etype": int(et_i),
+                    "rowid": int(rid_i),
+                }
+            )
+            if len(results) >= k:
+                break
+
+        self.neighbor_cache[cache_key] = [dict(x) for x in results]
+        return results
+
+    def get_multihop_neighbors_before(
+        self,
+        start_node: int,
+        cutoff_time,
+        num_hops: int,
+        top_k: int,
+    ):
+        if num_hops <= 0 or top_k <= 0:
+            return []
+
+        cutoff_abs = self._cutoff_to_int(cutoff_time)
+        cache_key = (start_node, cutoff_abs, num_hops, top_k)
+        cached = self.multihop_cache.get(cache_key)
+        if cached is not None:
+            return [dict(x) for x in cached]
+
+        results = []
+        visited = {start_node}
+        frontier = [(start_node, cutoff_abs)]
+
+        for hop in range(1, num_hops + 1):
+            next_frontier = []
+            hop_results = []
+
+            for node_id, node_cutoff in frontier:
+                nbrs = self.get_neighbors_before(node_id, node_cutoff, top_k)
+                for n in nbrs:
+                    hop_results.append({**n, "hop": hop})
+
+            if not hop_results:
+                break
+
+            # keep newest first, and avoid frontier blow-up
+            hop_results.sort(key=lambda x: x["ts"], reverse=True)
+
+            limited_hop_results = hop_results[: self.max_multihop_nodes_per_hop]
+            results.extend(limited_hop_results)
+
+            for n in limited_hop_results:
+                dst = n["dst"]
+                if dst in visited:
+                    continue
+                visited.add(dst)
+                next_frontier.append((dst, int(n["ts"])))
+
+            if not next_frontier:
+                break
+
+            frontier = next_frontier
+
+        self.multihop_cache[cache_key] = [dict(x) for x in results]
+        return results
+
+    def build_query_context(
+        self,
+        node_id: int,
+        cutoff_time,
+        k_hist: int = 10,
+        k_nbr: int = 10,
+        num_hops: int = 1,
+        logger=None,
+    ):
+        hist = self.get_history_before(node_id, cutoff_time, k_hist)
+
+        if logger:
+            logger.info(
+                "History for node_id=%d at cutoff_time=%s: %s",
+                node_id,
+                cutoff_time,
+                hist[:5],
+            )
+
+        hist_decoded = []
+        neighbor_rows = []
+        seen_neighbor_keys = set()
+
+        def append_neighbor_rows(source_row, neighbors):
+            for n in neighbors:
+                neighbor_key = (n["dst"], n["ts"], n["rowid"], n["hop"])
+                if neighbor_key in seen_neighbor_keys:
+                    continue
+                seen_neighbor_keys.add(neighbor_key)
+                neighbor_rows.append(
+                    {
+                        "src_row": source_row,
+                        "neighbor_entity": self.rev_node_id[n["dst"]],
+                        "etype": self.rev_edge_type[n["etype"]],
+                        "ts": n["ts"],
+                        "rowid": n["rowid"],
+                        "hop": n["hop"],
+                    }
+                )
+
+        # decode history rows once
+        for h in hist:
+            row = self.decode_row(h["rowid"])
+            hist_decoded.append(
+                {
+                    **row,
+                    "ts": h["ts"],
+                    "rowid": h["rowid"],
+                }
+            )
+
+        # neighbors for history rows
+        for h in hist_decoded:
+            row_node = self.node_id_map.get((h["table"], h["pk"]))
+            if row_node is None:
+                continue
+
+            nbrs = self.get_multihop_neighbors_before(
+                row_node,
+                h["ts"],
+                num_hops=num_hops,
+                top_k=k_nbr,
+            )
+            append_neighbor_rows(
+                {"table": h["table"], "pk": h["pk"], "time": h["ts"]},
+                nbrs,
+            )
+
+        # neighbors for query node
+        query_neighbors = self.get_multihop_neighbors_before(
+            node_id,
+            cutoff_time,
+            num_hops=num_hops,
+            top_k=k_nbr,
+        )
+        query_src = {
+            "table": self.rev_node_id[node_id][0],
+            "pk": self.rev_node_id[node_id][1],
+            "time": cutoff_time,
+        }
+        append_neighbor_rows(query_src, query_neighbors)
+
+        static = [
+            {**self.decode_row(rid), "rowid": rid}
+            for rid in self.get_static_info(node_id)
+        ]
+
+        return {
+            "entity": self.rev_node_id[node_id],
+            "static": static,
+            "history": hist_decoded,
+            "neighbors": neighbor_rows,
+        }
+
+    def serialize_context(self, ctx) -> str:
+        lines = []
+        table, pk = ctx["entity"]
+        lines.append(f"Entity: {table}({pk})")
+
+        if ctx["static"]:
+            lines.append("\nStatic Info:")
+            for r in ctx["static"]:
+                lines.append(f"- {r['table']}({r['pk']})")
+
+        if ctx["history"]:
+            lines.append("\nHistory:")
+            for r in ctx["history"]:
+                lines.append(f"- {r['table']}({r['pk']}) at {r['ts']}")
+
+        if ctx["neighbors"]:
+            lines.append("\nNeighbors:")
+            for n in ctx["neighbors"]:
+                etype = n["etype"]
+                nbr = n["neighbor_entity"]
+                lines.append(f"- via {etype} → {nbr} at {n['ts']}")
+
+        return "\n".join(lines)
+
+
+class RowFeatureExtractor:
+    """
+    Fast row materializer with caching.
+    """
+    def __init__(self, db, store):
+        self.tables = {}
+        self.store = store
+        self.row_cache: Dict[int, Dict[str, Any]] = {}
+
+        for name, table in db.table_dict.items():
+            df = table.df
+            self.tables[name] = {
+                "columns": list(df.columns),
+                "data": {col: df[col].values for col in df.columns},
+            }
+
+    def get_row(self, rowid: int):
+        cached = self.row_cache.get(rowid)
+        if cached is not None:
+            return cached
+
+        meta = self.store.decode_row(rowid)
+        table_name = meta["table"]
+        offset = self.store.table_row_offset[table_name]
+        local_id = rowid - offset
+        table = self.tables[table_name]
+
+        row = {
+            col: table["data"][col][local_id]
+            for col in table["columns"]
+        }
+        self.row_cache[rowid] = row
+        return row
+
+    def get_many_rows(self, rowids: Iterable[int]) -> Dict[int, Dict[str, Any]]:
+        out = {}
+        for rid in rowids:
+            out[int(rid)] = self.get_row(int(rid))
+        return out
+
+
+def normalize_time(ts):
+    if ts is None:
+        return "static"
+    if isinstance(ts, pd.Timestamp):
+        return str(ts.date())
+    if isinstance(ts, datetime.datetime):
+        return str(ts.date())
+    return str(datetime.datetime.utcfromtimestamp(ts / 1e9).date())
+
+
+def _is_informative_value(value):
+    if value is None:
+        return False
+    if isinstance(value, float) and np.isnan(value):
+        return False
+    return True
+
+
+def _select_display_columns(row):
+    priority_columns = []
+    fallback_columns = []
+    for key, value in row.items():
+        if not _is_informative_value(value):
+            continue
+        key_lower = key.lower()
+        if key_lower in {"id", "rowid"}:
+            continue
+        if "date" in key_lower or "time" in key_lower:
+            priority_columns.append(key)
+        elif key_lower.endswith("id"):
+            priority_columns.append(key)
+        elif any(
+            token in key_lower
+            for token in ["name", "title", "type", "status", "position", "point", "score", "value", "label"]
+        ):
+            priority_columns.append(key)
+        else:
+            fallback_columns.append(key)
+
+    selected_columns = []
+    for key in priority_columns + fallback_columns:
+        if key not in selected_columns:
+            selected_columns.append(key)
+        if len(selected_columns) >= 6:
+            break
+    return selected_columns
+
+
+def format_row(table_name, row, ts):
+    time_str = normalize_time(ts)
+    selected_columns = _select_display_columns(row)
+    features = [f"{k}={row.get(k)}" for k in selected_columns]
+    return f"[{time_str}] {table_name}: " + ", ".join(features)
+
+
+def format_task_history_row(task_name, row, time_col):
+    ts = row.get(time_col)
+    time_str = normalize_time(ts)
+    features = [f"{k}={v}" for k, v in row.items()]
+    return f"[{time_str}] {task_name}: " + ", ".join(features)
+
+
+def format_task_query_row(task_name, row, time_col, output_col):
+    ts = row.get(time_col)
+    time_str = normalize_time(ts)
+    features = [f"{k}={v}" for k, v in row.items() if k != output_col]
+    return f"[{time_str}] {task_name}: " + ", ".join(features)
+
+
+def _value_signature(value):
+    if not _is_informative_value(value):
+        return None
+    if isinstance(value, pd.Timestamp):
+        return str(value)
+    if hasattr(value, "item"):
+        try:
+            value = value.item()
+        except Exception:
+            pass
+    if isinstance(value, str):
+        return value.strip().lower()
+    if isinstance(value, (int, np.integer)):
+        return int(value)
+    if isinstance(value, (float, np.floating)):
+        return round(float(value), 3)
+    return str(value)
+
+
+def _similarity_score(query_row, candidate_row):
+    score = 0.0
+    shared = 0
+    query_keys = set(query_row.keys()) & set(candidate_row.keys())
+    for key in query_keys:
+        key_lower = key.lower()
+        if key_lower in {"id", "rowid"} or key_lower.endswith("id"):
+            continue
+        q_val = _value_signature(query_row[key])
+        c_val = _value_signature(candidate_row[key])
+        if q_val is None or c_val is None:
+            continue
+        shared += 1
+        if isinstance(q_val, str) and isinstance(c_val, str):
+            if q_val == c_val:
+                score += 2.0
+        elif isinstance(q_val, (int, float)) and isinstance(c_val, (int, float)):
+            denom = max(abs(float(q_val)), abs(float(c_val)), 1.0)
+            score += max(0.0, 1.0 - abs(float(q_val) - float(c_val)) / denom)
+        elif q_val == c_val:
+            score += 1.0
+    if shared == 0:
+        return -1.0
+    return score
+
+
+def build_similar_entity_context(store, extractor, node_id, cutoff_time, top_k, k_hist):
+    entity_table, _ = store.rev_node_id[node_id]
+    query_rowid = store.node_rowid_map.get(node_id)
+    if query_rowid is None:
+        return []
+
+    query_row = extractor.get_row(query_rowid)
+
+    candidate_nodes = store.nodes_by_table.get(entity_table, [])
+    if store.max_similarity_scan_per_table is not None and len(candidate_nodes) > store.max_similarity_scan_per_table:
+        candidate_nodes = candidate_nodes[: store.max_similarity_scan_per_table]
+
+    scored = []
+    for other_node_id in candidate_nodes:
+        if other_node_id == node_id:
+            continue
+        other_rowid = store.node_rowid_map.get(other_node_id)
+        if other_rowid is None:
+            continue
+        other_row = extractor.get_row(other_rowid)
+        score = _similarity_score(query_row, other_row)
+        if score <= 0:
+            continue
+        scored.append((score, other_node_id, other_rowid, other_row))
+
+    scored.sort(key=lambda item: (-item[0], store.rev_node_id[item[1]][1]))
+
+    similar_items = []
+    for score, other_node_id, _, other_row in scored[:top_k]:
+        history_rows = []
+        for history_item in store.get_history_before(other_node_id, cutoff_time, k_hist):
+            history_row = extractor.get_row(history_item["rowid"])
+            history_rows.append(
+                format_row(
+                    store.row_table[history_item["rowid"]],
+                    history_row,
+                    history_item["ts"],
+                )
+            )
+        similar_items.append(
+            {
+                "entity": f"{entity_table}({store.rev_node_id[other_node_id][1]})",
+                "score": round(score, 3),
+                "static": format_row(entity_table, other_row, None),
+                "history": history_rows,
+            }
+        )
+    return similar_items
+
+
+def build_semantic_context(
+    store,
+    extractor,
+    node_id,
+    cutoff_time,
+    k_hist,
+    top_k,
+    num_hops,
+    logger=None,
+    include_semantic_retrieval=False,
+):
+    ctx = store.build_query_context(
+        node_id,
+        cutoff_time,
+        k_hist=k_hist,
+        k_nbr=top_k,
+        num_hops=num_hops,
+        logger=logger,
+    )
+
+    needed_rowids = set()
+    for h in ctx["static"]:
+        needed_rowids.add(h["rowid"])
+    for h in ctx["history"]:
+        needed_rowids.add(h["rowid"])
+    for n in ctx["neighbors"]:
+        needed_rowids.add(n["rowid"])
+
+    row_map = extractor.get_many_rows(needed_rowids)
+
+    static_info = []
+    for h in ctx["static"]:
+        row = row_map[h["rowid"]]
+        static_info.append(
+            {
+                "table": h["table"],
+                "time": "static",
+                "text": format_row(h["table"], row, None),
+            }
+        )
+
+    semantic_history = []
+    for h in ctx["history"]:
+        row = row_map[h["rowid"]]
+        semantic_history.append(
+            {
+                "table": h["table"],
+                "time": normalize_time(h["ts"]),
+                "text": format_row(h["table"], row, h["ts"]),
+            }
+        )
+
+    semantic_neighbors = []
+    seen = set()
+    for n in ctx["neighbors"]:
+        key = (n["neighbor_entity"], n["ts"], n["rowid"], n["hop"])
+        if key in seen:
+            continue
+        seen.add(key)
+
+        edge_row_meta = store.decode_row(n["rowid"])
+        nbr_row = row_map[n["rowid"]]
+
+        semantic_neighbors.append(
+            {
+                "table": edge_row_meta["table"],
+                "text": (
+                    f"{format_row(edge_row_meta['table'], nbr_row, n['ts'])} "
+                    f"-> {n['neighbor_entity']} via {n['etype']}"
+                ),
+                "source_key": (edge_row_meta["table"], edge_row_meta["pk"], int(n["ts"])),
+                "source_text": format_row(edge_row_meta["table"], nbr_row, n["ts"]),
+                "neighbor_entity": n["neighbor_entity"],
+                "etype": n["etype"],
+                "hop": n["hop"],
+            }
+        )
+
+    return {
+        "static": static_info,
+        "history": semantic_history,
+        "neighbors": semantic_neighbors,
+        "similar": (
+            build_similar_entity_context(
+                store,
+                extractor,
+                node_id,
+                cutoff_time,
+                top_k=top_k,
+                k_hist=k_hist,
+            )
+            if include_semantic_retrieval
+            else []
+        ),
+    }
+
+
+def format_prompt(entity_name, entity_id, context, task_desc):
+    lines = []
+    lines.append(f"Task: {task_desc}")
+    lines.append("Return ONLY a number.")
+    lines.append("")
+    lines.append(f"Entity: {entity_name}({entity_id})")
+    lines.append("")
+
+    grouped = defaultdict(list)
+
+    if context["static"]:
+        lines.append("\nStatic:")
+        for r in context["static"]:
+            lines.append(f"- {r['text']}")
+
+    for h in context["history"]:
+        grouped[h["table"]].append(h)
+
+    lines.append("History (most recent first):")
+    for table, items in grouped.items():
+        lines.append(f"\n{table}:")
+        for i, item in enumerate(items[:10], 1):
+            lines.append(f"{i}. {item['text']}")
+
+    if context["neighbors"]:
+        lines.append("\nNeighbors:")
+        for i, n in enumerate(context["neighbors"][:10], 1):
+            lines.append(f"{i}. [hop={n['hop']}] {n['text']}")
+
+    lines.append("\nQuestion:")
+    lines.append(f"Predict {task_desc}.")
+    lines.append("")
+    lines.append("Answer:")
+
+    return "\n".join(lines)
+
+
+def summarize_neighbors_by_hop(neighbors):
+    summaries = []
+    grouped = {}
+    for neighbor in neighbors:
+        grouped.setdefault(neighbor["hop"], []).append(neighbor)
+
+    for hop in sorted(grouped):
+        items = grouped[hop]
+        table_counts = {}
+        for item in items:
+            table_name = item.get("table", "unknown")
+            table_counts[table_name] = table_counts.get(table_name, 0) + 1
+
+        top_tables = sorted(
+            table_counts.items(),
+            key=lambda kv: (-kv[1], kv[0]),
+        )[:3]
+        table_text = ", ".join(f"{name} x{count}" for name, count in top_tables)
+        summaries.append(
+            {
+                "hop": hop,
+                "count": len(items),
+                "tables": table_text,
+            }
+        )
+    return summaries
+
+
+def render_neighbor_graph(neighbors):
+    lines = []
+    grouped_by_hop = {}
+    for neighbor in neighbors:
+        grouped_by_hop.setdefault(neighbor["hop"], []).append(neighbor)
+
+    for hop in sorted(grouped_by_hop):
+        lines.append(f"Hop {hop}:")
+        source_groups = {}
+        source_order = []
+        for neighbor in grouped_by_hop[hop]:
+            source_key = neighbor["source_key"]
+            if source_key not in source_groups:
+                source_groups[source_key] = {
+                    "source_text": neighbor["source_text"],
+                    "edges": [],
+                }
+                source_order.append(source_key)
+            source_groups[source_key]["edges"].append(
+                f"{neighbor['etype'][1]} -> {neighbor['neighbor_entity'][0]}({neighbor['neighbor_entity'][1]})"
+            )
+
+        for source_key in source_order:
+            source_group = source_groups[source_key]
+            lines.append(f"- {source_group['source_text']}")
+            for edge_text in source_group["edges"]:
+                lines.append(f"  -> {edge_text}")
+
+    return lines
+
+
+def build_history_neighbor_context(
+    store,
+    extractor,
+    resource,
+    entity_value,
+    history_rows,
+    top_k,
+    num_hops,
+):
+    node_key = (resource.entity_table, entity_value)
+    node_id = store.node_id_map.get(node_key)
+
+    static_info = []
+    if node_id is not None:
+        static_rowids = store.get_static_info(node_id)
+        row_map = extractor.get_many_rows(static_rowids)
+        for rid in static_rowids:
+            row = row_map[rid]
+            meta = store.decode_row(rid)
+            static_info.append(
+                {
+                    "table": meta["table"],
+                    "time": "static",
+                    "text": format_row(meta["table"], row, None),
+                }
+            )
+
+    semantic_history = []
+    semantic_neighbors = []
+    seen_neighbors = set()
+    self_node_key = (resource.entity_table, entity_value)
+
+    for history_row in history_rows:
+        history_timestamp = pd.Timestamp(history_row[resource.time_col])
+        semantic_history.append(
+            {
+                "table": resource.task,
+                "time": normalize_time(history_timestamp),
+                "text": format_task_history_row(resource.task, history_row, resource.time_col),
+            }
+        )
+
+        history_node_id = store.node_id_map.get((resource.entity_table, history_row[resource.entity_col]))
+        if history_node_id is None:
+            continue
+
+        neighbors = store.get_multihop_neighbors_before(
+            history_node_id,
+            history_timestamp,
+            num_hops=num_hops,
+            top_k=top_k,
+        )
+        neighbor_rowids = [n["rowid"] for n in neighbors]
+        row_map = extractor.get_many_rows(neighbor_rowids)
+
+        for neighbor in neighbors:
+            neighbor_key = (neighbor["dst"], neighbor["ts"], neighbor["rowid"], neighbor["hop"])
+            if neighbor_key in seen_neighbors:
+                continue
+
+            neighbor_entity = store.rev_node_id[neighbor["dst"]]
+            if neighbor_entity == self_node_key:
+                continue
+
+            neighbor_row = row_map[neighbor["rowid"]]
+            edge_row_meta = store.decode_row(neighbor["rowid"])
+            if edge_row_meta["table"] == resource.entity_table and edge_row_meta["pk"] == entity_value:
+                continue
+
+            seen_neighbors.add(neighbor_key)
+            semantic_neighbors.append(
+                {
+                    "table": edge_row_meta["table"],
+                    "text": (
+                        f"{format_row(edge_row_meta['table'], neighbor_row, neighbor['ts'])} "
+                        f"-> {neighbor_entity[0]}({neighbor_entity[1]})"
+                    ),
+                    "source_key": (
+                        edge_row_meta["table"],
+                        edge_row_meta["pk"],
+                        int(neighbor["ts"]),
+                    ),
+                    "source_text": format_row(
+                        edge_row_meta["table"],
+                        neighbor_row,
+                        neighbor["ts"],
+                    ),
+                    "neighbor_entity": neighbor_entity,
+                    "etype": neighbor["etype"],
+                    "hop": neighbor["hop"],
+                }
+            )
+
+    return {
+        "static": static_info,
+        "history": semantic_history,
+        "neighbors": semantic_neighbors,
+    }
+
+
+
+
+
+def build_zero_shot_prompt(
+    store,
+    extractor,
+    resource,
+    query_row,
+    history_rows,
+    top_k,
+    num_hops,
+    include_hop_aggregation=True,
+    include_semantic_retrieval=False,
+    context_workers=1,
+):
+    ordered_history_rows = [dict(row) for row in history_rows]
+    entry_rows = ordered_history_rows + [dict(query_row)]
+
+    entry_contexts = []
+    for row in entry_rows:
+        entity_value = row[resource.entity_col]
+        cutoff_time = pd.Timestamp(row[resource.time_col])
+        node_id = store.node_id_map.get((resource.entity_table, entity_value))
+        if node_id is None:
+            continue
+
+        context = build_semantic_context(
+            store=store,
+            extractor=extractor,
+            node_id=node_id,
+            cutoff_time=cutoff_time,
+            k_hist=len(history_rows) if history_rows else top_k,
+            top_k=top_k,
+            num_hops=num_hops,
+            include_semantic_retrieval=include_semantic_retrieval,
+        )
+        entry_contexts.append({"row": row, "context": context})
+
+    lines = []
+
+    # =========================
+    # 🔥 STRONG HEADER (CRITICAL)
+    # =========================
+    lines.append(f"Task: Predict {resource.output_col}")
+    lines.append("Return ONLY a number. No explanation.")
+    lines.append("Follow the pattern in the examples exactly.")
+    lines.append("Valid outputs are numeric (e.g., 10, 12.5).")
+    lines.append("")
+
+    # =========================
+    # STATIC (UNCHANGED)
+    # =========================
+    query_node_id = store.node_id_map.get((resource.entity_table, query_row[resource.entity_col]))
+    if query_node_id is not None:
+        static_once = []
+        static_rowids = store.get_static_info(query_node_id)
+        static_rows = extractor.get_many_rows(static_rowids)
+
+        for rid in static_rowids:
+            row = static_rows[rid]
+            meta = store.decode_row(rid)
+            static_once.append(format_row(meta["table"], row, None))
+
+        if static_once:
+            lines.append("Static:")
+            for text in static_once:
+                lines.append(f"- {text}")
+
+    # =========================
+    # 🔥 KEEP ORIGINAL ICL STRUCTURE
+    # =========================
+    for idx, item in enumerate(entry_contexts, 1):
+        row = item["row"]
+        context = item["context"]
+        is_query = idx == len(entry_contexts)
+
+        lines.append("")
+
+        if is_query:
+            lines.append(
+                f"Query: {format_task_query_row(resource.task, row, resource.time_col, resource.output_col)}"
+            )
+        else:
+            lines.append(
+                f"Example {idx}: {format_task_query_row(resource.task, row, resource.time_col, resource.output_col)}"
+            )
+
+        # ---- history ----
+        if context["history"]:
+            lines.append("History:")
+            for history_item in context["history"]:
+                lines.append(f"- {history_item['text']}")
+
+        # ---- neighbors ----
+        if context["neighbors"]:
+            if include_hop_aggregation:
+                lines.append("Neighbor Summary:")
+                for summary in summarize_neighbors_by_hop(context["neighbors"]):
+                    lines.append(
+                        f"- hop {summary['hop']}: {summary['count']} neighbors"
+                        + (f" ({summary['tables']})" if summary["tables"] else "")
+                    )
+
+            lines.append("Neighbors:")
+            lines.extend(render_neighbor_graph(context["neighbors"]))
+
+        # ---- similar ----
+        if context.get("similar"):
+            lines.append("Similar Entities:")
+            for similar_item in context["similar"]:
+                lines.append(
+                    f"- {similar_item['entity']} | similarity={similar_item['score']} | {similar_item['static']}"
+                )
+                for history_text in similar_item["history"]:
+                    lines.append(f"  history: {history_text}")
+
+        # ---- output ----
+        if not is_query:
+            lines.append(f"Output: {row[resource.output_col]}")
+
+    # =========================
+    # 🔥 STRONG OUTPUT ANCHOR
+    # =========================
+    lines.append("")
+    lines.append(f"Predict the {resource.output_col} for the Query.")
+    lines.append("")
+    lines.append("Answer (number only):")
+
+    return "\n".join(lines)
+
+
+
+
+
+
+
+
+
+
+def build_zero_shot_prompt_old(
+    store,
+    extractor,
+    resource,
+    query_row,
+    history_rows,
+    top_k,
+    num_hops,
+    include_hop_aggregation=True,
+    include_semantic_retrieval=False,
+    context_workers=1,  # retained for compatibility, not used
+):
+    ordered_history_rows = [dict(row) for row in history_rows]
+    entry_rows = ordered_history_rows + [dict(query_row)]
+
+    entry_contexts = []
+    for row in entry_rows:
+        entity_value = row[resource.entity_col]
+        cutoff_time = pd.Timestamp(row[resource.time_col])
+        node_id = store.node_id_map.get((resource.entity_table, entity_value))
+        if node_id is None:
+            continue
+
+        context = build_semantic_context(
+            store=store,
+            extractor=extractor,
+            node_id=node_id,
+            cutoff_time=cutoff_time,
+            k_hist=len(history_rows) if history_rows else top_k,
+            top_k=top_k,
+            num_hops=num_hops,
+            include_semantic_retrieval=include_semantic_retrieval,
+        )
+        entry_contexts.append({"row": row, "context": context})
+
+    lines = []
+    lines.append(f"Task: {resource.output_col}")
+    lines.append("Return ONLY a number.")
+    lines.append(
+        "The prompt includes prior examples of the same task for the same entity, each paired with neighborhood context from its timestamp, plus neighborhood context for the final query timestamp."
+    )
+    lines.append("")
+
+    query_node_id = store.node_id_map.get((resource.entity_table, query_row[resource.entity_col]))
+    if query_node_id is not None:
+        static_once = []
+        static_rowids = store.get_static_info(query_node_id)
+        static_rows = extractor.get_many_rows(static_rowids)
+        for rid in static_rowids:
+            row = static_rows[rid]
+            meta = store.decode_row(rid)
+            static_once.append(format_row(meta["table"], row, None))
+
+        if static_once:
+            lines.append("Static:")
+            for text in static_once:
+                lines.append(f"- {text}")
+
+    for idx, item in enumerate(entry_contexts, 1):
+        row = item["row"]
+        context = item["context"]
+        lines.append("")
+        is_query = idx == len(entry_contexts)
+
+        if is_query:
+            lines.append(
+                f"Query {idx}: {format_task_query_row(resource.task, row, resource.time_col, resource.output_col)}"
+            )
+        else:
+            lines.append(
+                f"History Example {idx}: {format_task_query_row(resource.task, row, resource.time_col, resource.output_col)}"
+            )
+
+        if context["history"]:
+            lines.append("History:")
+            for history_item in context["history"]:
+                lines.append(f"- {history_item['text']}")
+
+        if context["neighbors"]:
+            if include_hop_aggregation:
+                lines.append("Neighbor Summary:")
+                for summary in summarize_neighbors_by_hop(context["neighbors"]):
+                    lines.append(
+                        f"- hop {summary['hop']}: {summary['count']} neighbors"
+                        + (f" ({summary['tables']})" if summary["tables"] else "")
+                    )
+            lines.append("Neighbors:")
+            lines.extend(render_neighbor_graph(context["neighbors"]))
+
+        if context.get("similar"):
+            lines.append("Similar Entities:")
+            for similar_item in context["similar"]:
+                lines.append(
+                    f"- {similar_item['entity']} | similarity={similar_item['score']} | {similar_item['static']}"
+                )
+                for history_text in similar_item["history"]:
+                    lines.append(f"  history: {history_text}")
+
+        if not is_query:
+            lines.append(f"Output: {row[resource.output_col]}")
+
+    lines.append("")
+    lines.append("Question:")
+    lines.append(f"Predict the {resource.output_col} for the final query.")
+    lines.append("")
+    lines.append("Answer:")
+
+    return "\n".join(lines)
+
