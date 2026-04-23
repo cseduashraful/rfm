@@ -1,10 +1,14 @@
 from dataclasses import dataclass, field
 from typing import Dict, List, Tuple, Optional, Any, Iterable
 from collections import defaultdict
+import csv
 import datetime
+import io
+import re
 
 import numpy as np
 import pandas as pd
+from task_history_queries import get_task_history_feature_hints
 
 
 @dataclass
@@ -153,7 +157,7 @@ class RelBenchGraphRAGStore:
             pk_col = table.pkey_col
             time_col = table.time_col
             col_idx = {col: idx for idx, col in enumerate(df.columns)}
-            pk_idx = col_idx[pk_col]
+            pk_idx = col_idx.get(pk_col) if pk_col is not None else None
             time_idx = col_idx[time_col] if time_col is not None else None
 
             row_table_append = self.row_table.append
@@ -161,8 +165,8 @@ class RelBenchGraphRAGStore:
             row_time_append = self.row_time.append
             get_or_create_node_id = self._get_or_create_node_id
 
-            for row in df.itertuples(index=False, name=None):
-                pk_val = row[pk_idx]
+            for local_row_idx, row in enumerate(df.itertuples(index=False, name=None)):
+                pk_val = row[pk_idx] if pk_idx is not None else f"__row_{local_row_idx}"
                 node_key = (table_name, pk_val)
                 nid = get_or_create_node_id(node_key)
                 self.nodes_by_table.setdefault(table_name, []).append(nid)
@@ -192,7 +196,7 @@ class RelBenchGraphRAGStore:
             fks = table.fkey_col_to_pkey_table
 
             col_idx = {col: idx for idx, col in enumerate(df.columns)}
-            pk_idx = col_idx[pk_col]
+            pk_idx = col_idx.get(pk_col) if pk_col is not None else None
             time_idx = col_idx[time_col] if time_col is not None else None
 
             fk_info = []
@@ -213,8 +217,8 @@ class RelBenchGraphRAGStore:
             etype_append = etype_list.append
             rowid_append = rowid_list.append
 
-            for row in df.itertuples(index=False, name=None):
-                pk_val = row[pk_idx]
+            for local_row_idx, row in enumerate(df.itertuples(index=False, name=None)):
+                pk_val = row[pk_idx] if pk_idx is not None else f"__row_{local_row_idx}"
                 src_node = node_id_map[(table_name, pk_val)]
 
                 if time_idx is not None:
@@ -1244,13 +1248,46 @@ def build_zero_shot_prompt(
     num_hops,
     include_hop_aggregation=True,
     include_semantic_retrieval=False,
+    use_dfs=False,
+    dfs_context_builder=None,
     context_workers=1,
+    precomputed_entry_dfs_summaries=None,
+    precomputed_entry_dfs_feature_dicts=None,
+    recent_context_k=2,
+    include_neighbors=True,
+    include_dfs_summary=True,
+    include_dfs_table=False,
+    other_neighbor_entity_count=5,
+    other_neighbor_history_count=3,
 ):
+    _ = context_workers
+    table_only_mode = include_dfs_table and not include_neighbors and not include_dfs_summary
+
+    def _visible_row_fields(row: Dict[str, Any]) -> Dict[str, Any]:
+        return {k: v for k, v in row.items() if not str(k).startswith("__")}
+
     ordered_history_rows = [dict(row) for row in history_rows]
     entry_rows = ordered_history_rows + [dict(query_row)]
+    entry_dfs_summaries = [[] for _ in entry_rows]
+    entry_dfs_feature_dicts = [{} for _ in entry_rows]
+    if use_dfs:
+        if precomputed_entry_dfs_summaries is not None:
+            entry_dfs_summaries = precomputed_entry_dfs_summaries
+        elif dfs_context_builder is not None:
+            entry_dfs_summaries = dfs_context_builder.summarize_rows(entry_rows)
+        else:
+            entry_dfs_summaries = [
+                ["- DFS context requested but FastDFS context builder is unavailable."]
+                for _ in entry_rows
+            ]
+        if include_dfs_table:
+            if precomputed_entry_dfs_feature_dicts is not None:
+                entry_dfs_feature_dicts = precomputed_entry_dfs_feature_dicts
+            elif dfs_context_builder is not None:
+                entry_dfs_feature_dicts = dfs_context_builder.feature_dicts_for_rows(entry_rows)
 
     entry_contexts = []
-    for row in entry_rows:
+    for row, dfs_summary in zip(entry_rows, entry_dfs_summaries):
         entity_value = row[resource.entity_col]
         cutoff_time = pd.Timestamp(row[resource.time_col])
         node_id = store.node_id_map.get((resource.entity_table, entity_value))
@@ -1267,17 +1304,148 @@ def build_zero_shot_prompt(
             num_hops=num_hops,
             include_semantic_retrieval=include_semantic_retrieval,
         )
-        entry_contexts.append({"row": row, "context": context})
+        entry_contexts.append({"row": row, "context": context, "dfs_summary": dfs_summary})
 
     lines = []
 
     # =========================
     # 🔥 STRONG HEADER (CRITICAL)
     # =========================
-    lines.append(f"Task: Predict {resource.output_col}")
-    lines.append("Return ONLY a number. No explanation.")
-    lines.append("Follow the pattern in the examples exactly.")
-    lines.append("Valid outputs are numeric (e.g., 10, 12.5).")
+    # lines.append(f"Task: Predict {resource.output_col} for the query node id")
+    # lines.append("Return ONLY a number. No explanation.")
+    # # lines.append("Follow the pattern in the examples exactly.")
+    # # lines.append("Valid outputs are numeric (e.g., 10, 12.5).")
+    # lines.append("The prompt contains first examples for the same entity - old to recent. and then recent interactions of the query entity from the database. Consider the old to recent pattern and recent activity and corresponing timestamps ")
+    # lines.append("")
+    # lines.append(f"Task: Predict {resource.output_col} for the query entity.")
+
+    # lines.append("Output format:")
+    # lines.append("- Return ONLY a single numeric value")
+    # lines.append("- No explanation, no text, no symbols")
+
+    # lines.append("Instructions:")
+    # lines.append("- The examples show historical values for the SAME entity in chronological order (oldest → most recent)")
+    # lines.append("- Learn how the value evolves over time based on recent activity")
+    # lines.append("- Use recency: more recent interactions are more important")
+    # lines.append("- Use trend: detect whether values are increasing, decreasing, or stable")
+    # lines.append("- Predict the next value for the query timestamp")
+
+    # lines.append("")
+
+    lines.append("Task: Predict the next value of the target variable for the same entity.")
+    lines.append("")
+    if table_only_mode and True:
+        lines.append("Guidelines:")
+        lines.append("- Focus primarily on the most recent rows of the same entity.")
+        lines.append("- Use earlier rows only to understand overall scale and typical behavior.")
+        lines.append("- If self history is limited, use similar entities to estimate a reasonable range.")
+        lines.append("- Do not overreact to a single outlier (self or neighbor).")
+        lines.append("- If signals conflict, prioritize recent self behavior over long-term averages or neighbors.")
+        lines.append("- Avoid defaulting to a generic mid-range value — base the prediction on actual patterns.")
+        lines.append("- Allow both upward and downward changes if supported by evidence.")
+        lines.append("- If the query row has feature values, compare them with recent self and neighbor rows.")
+        lines.append("- Identify rows with similar feature patterns and use their outputs as guidance.")
+        lines.append("- Prefer examples that are both recent and feature-similar.")
+        lines.append("- Use similarity to adjust the prediction, not to copy values directly.")
+    elif table_only_mode and False:
+        lines.append("Data Usage:")
+        lines.append("- Use the DFS Feature Table below as the only context.")
+        lines.append("- Self rows (same entity) are the PRIMARY signal when sufficient history exists.")
+        lines.append("- Neighbor rows are SECONDARY, but become IMPORTANT when self history is sparse or unstable.")
+        lines.append(
+            f"- Use up to {int(other_neighbor_entity_count)} nearby same-type neighbor entities "
+            f"and up to {int(other_neighbor_history_count)} most recent rows per neighbor."
+        )
+        lines.append("")
+        lines.append("Core Principle:")
+        lines.append("- Dynamically decide whether to trust SELF or NEIGHBORS more based on evidence strength.")
+        lines.append("")
+        lines.append("--------------------------------------------------")
+        lines.append("Step 0: Assess Self Evidence Strength")
+        lines.append("--------------------------------------------------")
+        lines.append("Determine how reliable the self history is:")
+        lines.append("")
+        lines.append("- STRONG self evidence:")
+        lines.append("  - 3 or more recent self rows, OR")
+        lines.append("  - clear stable trend (increasing, decreasing, or consistent level)")
+        lines.append("")
+        lines.append("- WEAK self evidence:")
+        lines.append("  - fewer than 3 self rows, OR")
+        lines.append("  - no clear pattern")
+        lines.append("")
+        lines.append("--------------------------------------------------")
+        lines.append("Step 1: Build Base Prediction")
+        lines.append("--------------------------------------------------")
+        lines.append("")
+        lines.append("IF self evidence is STRONG:")
+        lines.append("  - Use recent self rows to estimate level and trend")
+        lines.append("  - Extrapolate conservatively")
+        lines.append("")
+        lines.append("IF self evidence is WEAK:")
+        lines.append("  - Do NOT rely solely on the last self value")
+        lines.append("  - Use neighbors to estimate a reasonable scale and behavior")
+        lines.append("")
+        lines.append("--------------------------------------------------")
+        lines.append("Step 2: Use Neighbor Evidence (Carefully)")
+        lines.append("--------------------------------------------------")
+        lines.append("")
+        lines.append(f"From up to {int(other_neighbor_entity_count)} similar entities:")
+        lines.append("- Identify typical output range and behavior")
+        lines.append("- Look for:")
+        lines.append("  - common scale (e.g., low vs high values)")
+        lines.append("  - whether outputs tend to drop, spike, or stay stable")
+        lines.append("")
+        lines.append("Rules:")
+        lines.append("- Neighbors can ADJUST scale when self is weak")
+        lines.append("- Neighbors can NOT override strong self trends")
+        lines.append("- Do NOT copy neighbor values directly")
+        lines.append("")
+        lines.append("--------------------------------------------------")
+        lines.append("Step 3: Detect Possible Regime Change")
+        lines.append("--------------------------------------------------")
+        lines.append("")
+        lines.append("Consider a regime change if:")
+        lines.append("- Self history is very short (1-2 points)")
+        lines.append("- Neighbor values are consistently far from self value")
+        lines.append("- Feature patterns resemble neighbors more than past self")
+        lines.append("")
+        lines.append("In such cases:")
+        lines.append("- Allow larger deviation from last self value")
+        lines.append("- Move prediction toward neighbor-informed scale")
+        lines.append("")
+        lines.append("--------------------------------------------------")
+        lines.append("Step 4: Final Prediction Rules")
+        lines.append("--------------------------------------------------")
+        lines.append("")
+        lines.append("- If strong self trend -> stay close to self trajectory")
+        lines.append("- If weak self signal -> blend self + neighbor scale")
+        lines.append("- Allow large change ONLY if supported by:")
+        lines.append("  - weak self evidence AND")
+        lines.append("  - consistent neighbor pattern")
+        lines.append("")
+        lines.append("--------------------------------------------------")
+        lines.append("Constraints:")
+        lines.append("--------------------------------------------------")
+        lines.append("")
+        lines.append("- Do NOT blindly copy the last value")
+        lines.append("- Do NOT blindly copy neighbors")
+        lines.append("- Prefer realistic scale over strict smoothness")
+        lines.append("- Output must reflect the most plausible value given BOTH self and neighbors")
+        lines.append("")
+        lines.append("--------------------------------------------------")
+        lines.append("Output:")
+        lines.append("--------------------------------------------------")
+        lines.append("")
+        lines.append("Return a single numeric value only.")
+        lines.append("No explanation, no text, no symbols.")
+    else:
+        lines.append("Guidelines:")
+        lines.append("- Examples are ordered by time (oldest → newest)")
+        lines.append("- The target value depends on recent behavior")
+        lines.append("- Focus on the last few timestamps more than older ones")
+        lines.append("- Identify the trend (increasing, decreasing, stable)")
+        lines.append("- Extrapolate to predict the next value at the query time")
+
     lines.append("")
 
     # =========================
@@ -1302,62 +1470,364 @@ def build_zero_shot_prompt(
     # =========================
     # 🔥 KEEP ORIGINAL ICL STRUCTURE
     # =========================
-    for idx, item in enumerate(entry_contexts, 1):
-        row = item["row"]
-        context = item["context"]
-        is_query = idx == len(entry_contexts)
+    if not table_only_mode:
+        for idx, item in enumerate(entry_contexts, 1):
+            row = item["row"]
+            context = item["context"]
+            is_query = idx == len(entry_contexts)
+            example_scope = str(row.get("__example_scope", "self" if not is_query else "query"))
+            show_recent_context = idx > max(0, len(entry_contexts) - max(0, int(recent_context_k)))
+
+            lines.append("")
+
+            if is_query:
+                lines.append(
+                    f"Query: {format_task_query_row(resource.task, _visible_row_fields(row), resource.time_col, resource.output_col)}"
+                )
+            else:
+                # if idx == 1:
+                #     lines.append()
+                lines.append(
+                    f"Example {idx} [{example_scope}]: "
+                    f"{format_task_query_row(resource.task, _visible_row_fields(row), resource.time_col, resource.output_col)}"
+                )
+
+            # ---- neighbors ----
+            if include_neighbors and context["neighbors"] and show_recent_context:
+                if include_hop_aggregation:
+                    lines.append("Neighbor Summary:")
+                    for summary in summarize_neighbors_by_hop(context["neighbors"]):
+                        lines.append(
+                            f"- hop {summary['hop']}: {summary['count']} neighbors"
+                            + (f" ({summary['tables']})" if summary["tables"] else "")
+                        )
+
+                lines.append("Neighbors:")
+                lines.extend(render_neighbor_graph(context["neighbors"]))
+
+            if use_dfs and include_dfs_summary and show_recent_context:
+                lines.append("DFS Summary:")
+                dfs_summary_lines = item.get("dfs_summary", [])
+                if dfs_summary_lines:
+                    lines.extend(dfs_summary_lines)
+                else:
+                    lines.append("- No DFS-derived signals available for this timestamp.")
+
+            # ---- similar ----
+            if context.get("similar") and is_query:
+                lines.append("Similar Entities:")
+                for similar_item in context["similar"]:
+                    lines.append(
+                        f"- {similar_item['entity']} | similarity={similar_item['score']} | {similar_item['static']}"
+                    )
+                    for history_text in similar_item["history"]:
+                        lines.append(f"  history: {history_text}")
+
+            # ---- output ----
+            if not is_query:
+                lines.append(f"Output [{example_scope}]: {row[resource.output_col]}")
+
+    if use_dfs and include_dfs_table:
+        def _cell_text(value: Any) -> str:
+            if value is None:
+                return ""
+            if isinstance(value, float) and np.isnan(value):
+                return ""
+            return str(value)
+
+        max_dfs_table_features = 24
+        feature_hints = get_task_history_feature_hints(resource.dataset, resource.task) or {}
+        hinted_tables = {
+            str(table_name).lower(): int(weight)
+            for table_name, weight in feature_hints.get("tables", {}).items()
+        }
+        hinted_columns = {
+            (str(table_name).lower(), str(column_name).lower()): int(weight)
+            for (table_name, column_name), weight in feature_hints.get("columns", {}).items()
+        }
+
+        def _normalized_tokens(text: str) -> set[str]:
+            return {tok for tok in re.split(r"[^a-zA-Z0-9]+", text.lower()) if tok}
+
+        output_tokens = _normalized_tokens(str(resource.output_col))
+
+        def _feature_relevance_bonus(feature_name: str) -> int:
+            score = 0
+            lowered = feature_name.lower()
+
+            # Reward lexical overlap with task output name.
+            overlap = _normalized_tokens(lowered) & output_tokens
+            score += 2 * len(overlap)
+
+            # Reward table/column provenance from the task SQL.
+            matches = re.findall(r"([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)", feature_name)
+            seen_table_column = set()
+            for table_name, column_name in matches:
+                table_key = table_name.lower()
+                column_key = column_name.lower()
+                if table_key in hinted_tables:
+                    score += hinted_tables[table_key]
+                table_column_key = (table_key, column_key)
+                if table_column_key in hinted_columns and table_column_key not in seen_table_column:
+                    score += hinted_columns[table_column_key]
+                    seen_table_column.add(table_column_key)
+
+            # Light penalty for metadata-like columns unless explicitly hinted.
+            metadata_tokens = {"year", "round", "statusid", "raceid", "number"}
+            if any(token in lowered for token in metadata_tokens) and score == 0:
+                score -= 2
+
+            # Prefer statistical aggregates for table rendering.
+            aggregate_bonus = [
+                (".mean(", 4),
+                (".std(", 4),
+                (".sum(", 3),
+                (".count(", 3),
+                (".median(", 3),
+                (".var(", 2),
+                (".skew(", 2),
+                (".quantile(", 2),
+                (".percentile(", 2),
+                (".num_unique(", 2),
+            ]
+            for token, bonus in aggregate_bonus:
+                if token in lowered:
+                    score += bonus
+            return score
+
+        def _is_excluded_extreme_feature(feature_name: str) -> bool:
+            lowered = feature_name.lower()
+            return ".max(" in lowered or ".min(" in lowered
+
+        feature_scores: Dict[str, int] = {}
+        for idx, (row, row_features) in enumerate(zip(entry_rows, entry_dfs_feature_dicts), 1):
+            is_query_row = idx == len(entry_rows)
+            if is_query_row:
+                weight = 2
+            elif str(row.get("__example_scope", "self")) == "self":
+                weight = 3
+            else:
+                weight = 1
+            for feature_name in row_features.keys():
+                if _is_excluded_extreme_feature(feature_name):
+                    continue
+                feature_scores[feature_name] = feature_scores.get(feature_name, 0) + weight
+
+        ranked_feature_names = sorted(
+            feature_scores.keys(),
+            key=lambda name: (
+                -(feature_scores[name] + _feature_relevance_bonus(name)),
+                -feature_scores[name],
+                name,
+            ),
+        )
+        feature_names = ranked_feature_names[:max_dfs_table_features]
+        max_delta_features = 8
+
+        def _parse_float_or_none(text: Any) -> float | None:
+            if text is None:
+                return None
+            text_s = str(text).strip()
+            if not text_s:
+                return None
+            try:
+                return float(text_s)
+            except Exception:
+                return None
+
+        def _select_delta_feature_names(candidates: list[str]) -> list[str]:
+            priority_buckets = [".count(", ".mean(", ".std(", ".sum("]
+            selected: list[str] = []
+            seen = set()
+            lowered_candidates = [(name, name.lower()) for name in candidates]
+
+            for token in priority_buckets:
+                for name, lowered in lowered_candidates:
+                    if name in seen:
+                        continue
+                    if token in lowered:
+                        selected.append(name)
+                        seen.add(name)
+                        if len(selected) >= max_delta_features:
+                            return selected
+
+            # Fill remaining slots with task-relevant candidates.
+            for name in candidates:
+                if name in seen:
+                    continue
+                selected.append(name)
+                seen.add(name)
+                if len(selected) >= max_delta_features:
+                    break
+            return selected
+
+        delta_feature_names = _select_delta_feature_names(feature_names)
+        delta_column_names = [f"delta::{name}" for name in delta_feature_names]
+
+        def _render_dfs_section(
+            section_title: str,
+            rows_with_features: list[tuple[int, dict[str, Any], dict[str, str], bool]],
+            section_scope: str,
+        ) -> None:
+            lines.append("")
+            lines.append(section_title)
+            if not rows_with_features:
+                lines.append("- none")
+                return
+
+            table_stream = io.StringIO()
+            writer = csv.writer(table_stream)
+            header = [
+                "entry_index",
+                resource.entity_col,
+                resource.time_col,
+                "output",
+            ] + feature_names + delta_column_names
+            writer.writerow(header)
+
+            prev_values_by_entity: Dict[str, Dict[str, float]] = {}
+            for idx, row, row_features, is_query_row in rows_with_features:
+                output_value = "?" if is_query_row else _cell_text(row.get(resource.output_col))
+                entity_key = _cell_text(row.get(resource.entity_col))
+                prev_values = prev_values_by_entity.get(entity_key, {})
+                row_cells = [
+                    str(idx),
+                    _cell_text(row.get(resource.entity_col)),
+                    _cell_text(row.get(resource.time_col)),
+                    output_value,
+                ]
+                for feature_name in feature_names:
+                    row_cells.append(row_features.get(feature_name, ""))
+                current_values_for_entity: Dict[str, float] = dict(prev_values)
+                for feature_name in delta_feature_names:
+                    current_val = _parse_float_or_none(row_features.get(feature_name, ""))
+                    previous_val = prev_values.get(feature_name)
+                    if current_val is None or previous_val is None:
+                        row_cells.append("")
+                    else:
+                        row_cells.append(_cell_text(current_val - previous_val))
+                    if current_val is not None:
+                        current_values_for_entity[feature_name] = current_val
+                prev_values_by_entity[entity_key] = current_values_for_entity
+                writer.writerow(row_cells)
+
+            lines.append("```csv")
+            lines.append(table_stream.getvalue().rstrip())
+            lines.append("```")
+
+            # Show MIN/MAX once per entity only for self section.
+            if section_scope != "self":
+                return
+
+            minmax_candidates = sorted(
+                {
+                    name
+                    for _, _, row_features, _ in rows_with_features
+                    for name in row_features.keys()
+                    if ".min(" in name.lower() or ".max(" in name.lower()
+                },
+                key=lambda name: (
+                    -(feature_scores.get(name, 0) + _feature_relevance_bonus(name)),
+                    -feature_scores.get(name, 0),
+                    name,
+                ),
+            )[:8]
+
+            if not minmax_candidates:
+                return
+
+            latest_row_by_entity: Dict[str, tuple[pd.Timestamp, dict[str, Any], dict[str, str]]] = {}
+            for _, row, row_features, is_query_row in rows_with_features:
+                if is_query_row:
+                    continue
+                entity_key = _cell_text(row.get(resource.entity_col))
+                ts_raw = row.get(resource.time_col)
+                ts = pd.Timestamp.min
+                try:
+                    ts = pd.Timestamp(ts_raw)
+                except Exception:
+                    pass
+                existing = latest_row_by_entity.get(entity_key)
+                if existing is None or ts >= existing[0]:
+                    latest_row_by_entity[entity_key] = (ts, row, row_features)
+
+            if not latest_row_by_entity:
+                return
+
+            def _minmax_base_key(feature_name: str) -> str:
+                lowered = feature_name.lower()
+                base = re.sub(r"\.min\(", ".agg(", lowered)
+                base = re.sub(r"\.max\(", ".agg(", base)
+                return base
+
+            lines.append("Latest Min/Max (Self):")
+            for entity_key in sorted(latest_row_by_entity.keys()):
+                ts, row, row_features = latest_row_by_entity[entity_key]
+                minmax_by_base: Dict[str, Dict[str, str]] = {}
+                display_name_by_base: Dict[str, str] = {}
+                for feature_name in minmax_candidates:
+                    value = row_features.get(feature_name, "")
+                    if value == "":
+                        continue
+                    lowered = feature_name.lower()
+                    agg = "min" if ".min(" in lowered else ("max" if ".max(" in lowered else None)
+                    if agg is None:
+                        continue
+                    base = _minmax_base_key(feature_name)
+                    minmax_by_base.setdefault(base, {})[agg] = value
+                    display_name_by_base.setdefault(base, feature_name)
+
+                if not minmax_by_base:
+                    continue
+
+                rendered_pairs = []
+                for base in sorted(minmax_by_base.keys()):
+                    stats = minmax_by_base[base]
+                    feature_label = display_name_by_base[base]
+                    cleaned_label = re.sub(r"\.MIN\(", ".AGG(", feature_label)
+                    cleaned_label = re.sub(r"\.MAX\(", ".AGG(", cleaned_label)
+                    min_text = stats.get("min", "?")
+                    max_text = stats.get("max", "?")
+                    rendered_pairs.append(f"{cleaned_label}: min={min_text}, max={max_text}")
+
+                timestamp_text = _cell_text(row.get(resource.time_col))
+                lines.append(
+                    f"- {resource.entity_col}={entity_key} at {timestamp_text}: "
+                    + "; ".join(rendered_pairs)
+                )
+
+        self_rows: list[tuple[int, dict[str, Any], dict[str, str], bool]] = []
+        other_rows: list[tuple[int, dict[str, Any], dict[str, str], bool]] = []
+        query_rows: list[tuple[int, dict[str, Any], dict[str, str], bool]] = []
+
+        for idx, (row, row_features) in enumerate(zip(entry_rows, entry_dfs_feature_dicts), 1):
+            is_query_row = idx == len(entry_rows)
+            scope = "query" if is_query_row else str(row.get("__example_scope", "self"))
+            row_tuple = (idx, row, row_features, is_query_row)
+            if scope == "self":
+                self_rows.append(row_tuple)
+            elif scope == "other":
+                other_rows.append(row_tuple)
+            else:
+                query_rows.append(row_tuple)
 
         lines.append("")
+        lines.append("DFS Table Notes:")
+        lines.append("- Temporal order is oldest -> newest.")
+        lines.append("- Self rows = primary evidence.")
+        lines.append("- Neighbor rows = analogical evidence (not direct prediction).")
+        _render_dfs_section("DFS Feature Table (Self Examples):", self_rows, "self")
+        _render_dfs_section("DFS Feature Table (Other Examples):", other_rows, "other")
+        _render_dfs_section("DFS Feature Table (Query Row):", query_rows, "query")
 
-        if is_query:
-            lines.append(
-                f"Query: {format_task_query_row(resource.task, row, resource.time_col, resource.output_col)}"
-            )
-        else:
-            lines.append(
-                f"Example {idx}: {format_task_query_row(resource.task, row, resource.time_col, resource.output_col)}"
-            )
-
-        # ---- history ----
-        if context["history"]:
-            lines.append("History:")
-            for history_item in context["history"]:
-                lines.append(f"- {history_item['text']}")
-
-        # ---- neighbors ----
-        if context["neighbors"]:
-            if include_hop_aggregation:
-                lines.append("Neighbor Summary:")
-                for summary in summarize_neighbors_by_hop(context["neighbors"]):
-                    lines.append(
-                        f"- hop {summary['hop']}: {summary['count']} neighbors"
-                        + (f" ({summary['tables']})" if summary["tables"] else "")
-                    )
-
-            lines.append("Neighbors:")
-            lines.extend(render_neighbor_graph(context["neighbors"]))
-
-        # ---- similar ----
-        if context.get("similar"):
-            lines.append("Similar Entities:")
-            for similar_item in context["similar"]:
-                lines.append(
-                    f"- {similar_item['entity']} | similarity={similar_item['score']} | {similar_item['static']}"
-                )
-                for history_text in similar_item["history"]:
-                    lines.append(f"  history: {history_text}")
-
-        # ---- output ----
-        if not is_query:
-            lines.append(f"Output: {row[resource.output_col]}")
-
-    # =========================
-    # 🔥 STRONG OUTPUT ANCHOR
-    # =========================
-    lines.append("")
-    lines.append(f"Predict the {resource.output_col} for the Query.")
-    lines.append("")
-    lines.append("Answer (number only):")
+    if not table_only_mode:
+        # =========================
+        # 🔥 STRONG OUTPUT ANCHOR
+        # =========================
+        lines.append("")
+        lines.append("Predict the output value for the Query using the output column from the examples.")
+        lines.append("")
+        lines.append("Answer (number only):")
 
     return "\n".join(lines)
 
@@ -1478,4 +1948,3 @@ def build_zero_shot_prompt_old(
     lines.append("Answer:")
 
     return "\n".join(lines)
-

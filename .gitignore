@@ -1,6 +1,8 @@
 # OS / editor
 .DS_Store
 .vscode/
+*.swp
+*.swo
 
 # Python
 __pycache__/
@@ -10,6 +12,10 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.ipynb_checkpoints/
+*.egg-info/
+build/
+dist/
 
 # Environments
 .env
@@ -19,6 +25,9 @@ venv/
 # Local artifacts
 artifacts/
 # Includes preprocessed train data under artifacts/preprocessed_train/
+v2/phase1/artifacts/
+v2/phase2/artifacts/
+v2/phase3/artifacts/
 
 # LaTeX build outputs
 *.aux
@@ -44,3 +53,8 @@ missfont.log
 
 # Generated PDFs
 *.pdf
+
+# Cluster/runtime logs
+slurm-*.out
+*.err
+*.log

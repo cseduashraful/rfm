@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
+import duckdb
 import pandas as pd
 import torch
 
 from load_inference_config import normalize_inference_config
+from task_history_queries import get_task_history_query, get_task_history_query_bulk
 from train_data import (
     TaskResource,
     build_task_resource,
@@ -119,6 +122,187 @@ class TemporalHistoryStore:
         return [self.records[row_id] for row_id in sampled_row_ids]
 
 
+@dataclass(slots=True)
+class DatasetHistoryDiskCache:
+    db_path: Path
+    entity_col: str
+    time_col: str
+
+
+_DATASET_HISTORY_CACHE_VERSION = "v1"
+_DATASET_HISTORY_CHUNK_SIZE = 16
+_DATASET_HISTORY_MAX_ROWS_PER_CHUNK = 250_000
+
+
+def inference_history_cache_dir() -> Path:
+    return Path(__file__).resolve().parents[1] / "artifacts" / "inference_history_cache"
+
+
+def _quote_ident(name: str) -> str:
+    return '"' + name.replace('"', '""') + '"'
+
+
+def _dataset_history_cache_path(resource: TaskResource) -> Path:
+    filename = (
+        f"{_DATASET_HISTORY_CACHE_VERSION}__{resource.dataset}__{resource.task}"
+        "__dataset_history.duckdb"
+    )
+    return inference_history_cache_dir() / filename
+
+
+def _create_empty_history_table(conn: duckdb.DuckDBPyConnection, resource: TaskResource) -> None:
+    empty_frame = resource.task_object.get_table("train", mask_input_cols=False).df.head(0)
+    conn.register("empty_history_frame", empty_frame)
+    conn.execute("CREATE TABLE history AS SELECT * FROM empty_history_frame")
+    conn.unregister("empty_history_frame")
+
+
+def _iter_timestamp_batches(timestamps: pd.Series, batch_size: int):
+    for chunk_start in range(0, len(timestamps), batch_size):
+        chunk = timestamps.iloc[chunk_start : chunk_start + batch_size]
+        if not chunk.empty:
+            yield chunk
+
+
+def _materialize_history_chunks(
+    resource: TaskResource,
+    timestamps: pd.Series,
+    *,
+    max_rows_per_chunk: int,
+) -> list[pd.DataFrame]:
+    if timestamps.empty:
+        return []
+
+    history_table = resource.task_object.make_table(resource.db, timestamps)
+    chunk_frame = history_table.df
+    if chunk_frame.empty:
+        return []
+
+    if len(chunk_frame) <= max_rows_per_chunk or len(timestamps) == 1:
+        return [chunk_frame]
+
+    midpoint = len(timestamps) // 2
+    left = timestamps.iloc[:midpoint]
+    right = timestamps.iloc[midpoint:]
+    out: list[pd.DataFrame] = []
+    out.extend(
+        _materialize_history_chunks(
+            resource,
+            left,
+            max_rows_per_chunk=max_rows_per_chunk,
+        )
+    )
+    out.extend(
+        _materialize_history_chunks(
+            resource,
+            right,
+            max_rows_per_chunk=max_rows_per_chunk,
+        )
+    )
+    return out
+
+
+def _build_dataset_history_disk_cache(
+    resource: TaskResource,
+    timestamps: pd.Series,
+    *,
+    force_rebuild: bool = False,
+    verbose: bool = False,
+) -> DatasetHistoryDiskCache:
+    cache_path = _dataset_history_cache_path(resource)
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if force_rebuild and cache_path.exists():
+        cache_path.unlink()
+
+    if cache_path.exists():
+        return DatasetHistoryDiskCache(
+            db_path=cache_path,
+            entity_col=resource.entity_col,
+            time_col=resource.time_col,
+        )
+
+    temp_path = cache_path.with_suffix(cache_path.suffix + ".tmp")
+    if temp_path.exists():
+        temp_path.unlink()
+
+    if verbose:
+        print(f"building dataset history cache at {cache_path}")
+
+    conn = duckdb.connect(str(temp_path))
+    conn.execute(f"PRAGMA threads={max(1, resource.history_parallel_workers)}")
+
+    history_initialized = False
+    total_rows = 0
+    entity_col_sql = _quote_ident(resource.entity_col)
+    time_col_sql = _quote_ident(resource.time_col)
+
+    try:
+        base_batches = list(_iter_timestamp_batches(timestamps, _DATASET_HISTORY_CHUNK_SIZE))
+        num_base_batches = len(base_batches)
+        for batch_index, chunk in enumerate(base_batches, start=1):
+            materialized_chunks = _materialize_history_chunks(
+                resource,
+                chunk,
+                max_rows_per_chunk=_DATASET_HISTORY_MAX_ROWS_PER_CHUNK,
+            )
+            for chunk_frame in materialized_chunks:
+                total_rows += len(chunk_frame)
+                conn.register("history_chunk", chunk_frame)
+                if not history_initialized:
+                    conn.execute("CREATE TABLE history AS SELECT * FROM history_chunk")
+                    history_initialized = True
+                else:
+                    conn.execute("INSERT INTO history SELECT * FROM history_chunk")
+                conn.unregister("history_chunk")
+
+            if verbose and (batch_index == 1 or batch_index % 25 == 0 or batch_index == num_base_batches):
+                print(
+                    "  history cache batch "
+                    f"{batch_index}/{max(1, num_base_batches)} "
+                    f"(rows so far={total_rows})"
+                )
+
+        if not history_initialized:
+            _create_empty_history_table(conn, resource)
+        else:
+            conn.execute(
+                f"""
+                CREATE TABLE history_dedup AS
+                SELECT * EXCLUDE (__rn)
+                FROM (
+                    SELECT *,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY {entity_col_sql}, {time_col_sql}
+                               ORDER BY {time_col_sql}
+                           ) AS __rn
+                    FROM history
+                )
+                WHERE __rn = 1
+                ORDER BY {entity_col_sql}, {time_col_sql}
+                """
+            )
+            conn.execute("DROP TABLE history")
+            conn.execute("ALTER TABLE history_dedup RENAME TO history")
+
+        conn.execute(
+            f"CREATE INDEX history_entity_time_idx ON history ({entity_col_sql}, {time_col_sql})"
+        )
+        conn.execute("CHECKPOINT")
+    finally:
+        conn.close()
+
+    temp_path.replace(cache_path)
+    if verbose:
+        print(f"finished dataset history cache at {cache_path}")
+
+    return DatasetHistoryDiskCache(
+        db_path=cache_path,
+        entity_col=resource.entity_col,
+        time_col=resource.time_col,
+    )
+
+
 def build_raw_dataset_timestamps(db: Any) -> pd.Series:
     timestamp_series: list[pd.Series] = []
     for table in db.table_dict.values():
@@ -146,6 +330,51 @@ def _materialize_history(
     return [dict(record) for record in records]
 
 
+def _sample_history_frame(
+    history_frame: pd.DataFrame,
+    resource: TaskResource,
+) -> pd.DataFrame:
+    if history_frame.empty:
+        return history_frame
+
+    if resource.history_sampling_strategy not in {
+        "random_prior",
+        "most_recent_k",
+        "recent_min_overlap",
+    }:
+        raise ValueError(
+            f"Unsupported history sampling strategy: {resource.history_sampling_strategy}"
+        )
+
+    history_frame = history_frame.sort_values(
+        by=[resource.time_col],
+        kind="stable",
+    ).reset_index(drop=True)
+    history_frame = history_frame.drop_duplicates(
+        subset=[resource.entity_col, resource.time_col],
+        keep="first",
+    ).reset_index(drop=True)
+    if resource.history_sampling_strategy == "most_recent_k":
+        return history_frame.tail(resource.history_length)
+    if resource.history_sampling_strategy == "recent_min_overlap":
+        timestamp_values = [
+            int(pd.Timestamp(value).value) for value in history_frame[resource.time_col].tolist()
+        ]
+        selected_indices = _select_recent_min_overlap_indices(
+            timestamp_values,
+            resource.history_length,
+            resource.label_horizon_ns,
+        )
+        return history_frame.iloc[selected_indices]
+
+    sample_size = min(resource.history_length, len(history_frame))
+    permutation = torch.randperm(len(history_frame))[:sample_size].tolist()
+    return history_frame.iloc[permutation].sort_values(
+        by=[resource.time_col],
+        kind="stable",
+    )
+
+
 def build_inference_resource(
     config: dict[str, Any],
     no_dataset_download: bool = False,
@@ -170,6 +399,15 @@ def build_inference_resource(
 
 
 def build_history_store(resource: TaskResource) -> tuple[Any, bool]:
+    return build_history_store_with_options(resource)
+
+
+def build_history_store_with_options(
+    resource: TaskResource,
+    *,
+    force_rebuild: bool = False,
+    verbose: bool = False,
+) -> tuple[Any, bool]:
     if resource.history_source == "task_table":
         frame = resource.frame.copy()
         frame = frame.rename(columns={resource.time_col: "timestamp"})
@@ -178,7 +416,24 @@ def build_history_store(resource: TaskResource) -> tuple[Any, bool]:
     if resource.history_source != "dataset":
         raise ValueError(f"Unsupported history source: {resource.history_source}")
 
-    return build_raw_dataset_timestamps(resource.db), True
+    optimized_query = get_task_history_query(resource.dataset, resource.task)
+    optimized_bulk_query = get_task_history_query_bulk(resource.dataset, resource.task)
+    if optimized_query is not None:
+        if verbose:
+            print(f"using optimized history query for {resource.dataset}/{resource.task}")
+        return {
+            "optimized_query": optimized_query,
+            "optimized_bulk_query": optimized_bulk_query,
+        }, True
+
+    timestamps = build_raw_dataset_timestamps(resource.db)
+    cache = _build_dataset_history_disk_cache(
+        resource,
+        timestamps,
+        force_rebuild=force_rebuild,
+        verbose=verbose,
+    )
+    return cache, True
 
 
 def build_inference_history(
@@ -206,58 +461,133 @@ def build_inference_history(
         resource.label_horizon_ns,
         unit="ns",
     )
-    candidate_timestamps = store[store < query_time]
-    if candidate_timestamps.empty:
-        return []
-
-    history_table = resource.task_object.make_table(resource.db, candidate_timestamps)
-    history_frame = history_table.df
-    history_frame = history_frame[history_frame[resource.entity_col] == entity_value]
-    history_frame = history_frame[
-        pd.to_datetime(history_frame[resource.time_col]) <= effective_cutoff
-    ]
-    if history_frame.empty:
-        return []
-
-    if resource.history_sampling_strategy not in {
-        "random_prior",
-        "most_recent_k",
-        "recent_min_overlap",
-    }:
-        raise ValueError(
-            f"Unsupported history sampling strategy: {resource.history_sampling_strategy}"
-        )
-
-    history_frame = history_frame.sort_values(by=[resource.time_col], kind="stable").reset_index(drop=True)
-    history_frame = history_frame.drop_duplicates(
-        subset=[resource.entity_col, resource.time_col],
-        keep="first",
-    ).reset_index(drop=True)
-    if resource.history_sampling_strategy == "most_recent_k":
-        sampled_records = history_frame.tail(resource.history_length)
-    elif resource.history_sampling_strategy == "recent_min_overlap":
-        timestamp_values = [
-            int(pd.Timestamp(value).value) for value in history_frame[resource.time_col].tolist()
+    optimized_query = None
+    if isinstance(store, dict):
+        optimized_query = store.get("optimized_query")
+    if optimized_query is not None:
+        history_frame = optimized_query(resource, entity_value, effective_cutoff)
+        if history_frame.empty:
+            return []
+        history_frame = history_frame[
+            pd.to_datetime(history_frame[resource.time_col]) <= effective_cutoff
         ]
-        selected_indices = _select_recent_min_overlap_indices(
-            timestamp_values,
-            resource.history_length,
-            resource.label_horizon_ns,
-        )
-        sampled_records = history_frame.iloc[selected_indices]
+        if history_frame.empty:
+            return []
     else:
-        sample_size = min(resource.history_length, len(history_frame))
-        permutation = torch.randperm(len(history_frame))[:sample_size].tolist()
-        sampled_records = history_frame.iloc[permutation].sort_values(
-            by=[resource.time_col],
-            kind="stable",
-        )
+        with duckdb.connect(str(store.db_path), read_only=True) as conn:
+            history_frame = conn.execute(
+                f"""
+                SELECT *
+                FROM history
+                WHERE {_quote_ident(store.entity_col)} = ?
+                  AND {_quote_ident(store.time_col)} <= ?
+                ORDER BY {_quote_ident(store.time_col)}
+                """,
+                [entity_value, effective_cutoff],
+            ).fetch_df()
+        if history_frame.empty:
+            return []
+
+    sampled_records = _sample_history_frame(history_frame, resource)
     return _materialize_history(
         sampled_records.to_dict(orient="records"),
         resource.entity_col,
         resource.time_col,
         resource.output_col,
     )
+
+
+def build_inference_histories_bulk(
+    store: Any,
+    resource: TaskResource,
+    requests: list[tuple[int, Any, Any]],
+) -> dict[int, list[dict[str, Any]]]:
+    if not requests:
+        return {}
+
+    out: dict[int, list[dict[str, Any]]] = {}
+    if resource.history_source == "task_table":
+        for request_id, entity_value, cutoff_time in requests:
+            out[request_id] = build_inference_history(
+                store,
+                resource,
+                entity_value,
+                cutoff_time,
+            )
+        return out
+
+    if resource.history_source != "dataset":
+        raise ValueError(f"Unsupported history source: {resource.history_source}")
+
+    optimized_bulk_query = None
+    if isinstance(store, dict):
+        optimized_bulk_query = store.get("optimized_bulk_query")
+
+    if optimized_bulk_query is None:
+        for request_id, entity_value, cutoff_time in requests:
+            out[request_id] = build_inference_history(
+                store,
+                resource,
+                entity_value,
+                cutoff_time,
+            )
+        return out
+
+    request_rows: list[dict[str, Any]] = []
+    for request_id, entity_value, cutoff_time in requests:
+        query_time = pd.Timestamp(cutoff_time)
+        effective_cutoff = query_time - pd.to_timedelta(
+            resource.label_horizon_ns,
+            unit="ns",
+        )
+        request_rows.append(
+            {
+                "request_id": int(request_id),
+                "entity_value": entity_value,
+                "effective_cutoff": effective_cutoff,
+                "query_time": query_time,
+            }
+        )
+
+    request_frame = pd.DataFrame(request_rows)
+    history_frame = optimized_bulk_query(resource, request_frame)
+
+    if history_frame.empty:
+        for request_id, _, _ in requests:
+            out[int(request_id)] = []
+        return out
+
+    history_by_request = {
+        int(request_id): frame.reset_index(drop=True)
+        for request_id, frame in history_frame.groupby("request_id", sort=False)
+    }
+
+    for request_row in request_rows:
+        request_id = int(request_row["request_id"])
+        query_time = request_row["query_time"]
+        frame = history_by_request.get(request_id)
+        if frame is None or frame.empty:
+            out[request_id] = []
+            continue
+        if "request_id" in frame.columns:
+            frame = frame.drop(columns=["request_id"])
+        frame = frame[
+            pd.to_datetime(frame[resource.time_col]) <= request_row["effective_cutoff"]
+        ]
+        if frame.empty:
+            out[request_id] = []
+            continue
+        sampled_records = _sample_history_frame(frame, resource)
+        materialized = _materialize_history(
+            sampled_records.to_dict(orient="records"),
+            resource.entity_col,
+            resource.time_col,
+            resource.output_col,
+        )
+        validate_history_non_overlap(materialized, resource, query_time)
+        out[request_id] = materialized
+
+    return out
 
 
 def validate_history_non_overlap(

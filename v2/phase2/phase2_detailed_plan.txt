@@ -1,0 +1,279 @@
+PHASE 2 DETAILED IMPLEMENTATION PLAN
+Task Compilation (Dataset-Aware, Task-Agnostic Rules)
+
+==================================================
+0) OBJECTIVE
+==================================================
+Compile a single task into an executable retrieval+feature policy using:
+- task description/runtime metadata
+- Phase 1 artifacts
+- solver-critic LLM loop (local model, default 8B)
+
+Primary output:
+- task_spec.json
+
+==================================================
+1) FIXED DECISIONS (FROM CLARIFICATION)
+==================================================
+- Default artifact input location:
+  RFM/v2/phase1/artifacts/<dataset>/
+- Dataset from CLI (default rel-f1)
+- One task at a time (required: --task)
+- Solver and critic use local LLM (default 8b), model selectable by CLI
+- Low-confidence FK paths remain excluded by default
+- Budget defaults:
+  - self_history_budget: 10
+  - one_hop_budget: 10
+  - multi_hop_budget_total: 50
+  - neighbor_budget: 10
+- Solver-critic loop:
+  max_rounds=3, early stop when critic finds no major issues
+
+Assumption (unless changed):
+- task_spec.json includes:
+  task definition, path scoring rules, feature rules, depth policy, budget policy,
+  safety constraints, solver/critic diagnostics.
+
+==================================================
+2) INPUTS
+==================================================
+2.1 CLI Inputs
+- --dataset (default rel-f1)
+- --task (required)
+- --phase1-artifacts-dir (default RFM/v2/phase1/artifacts)
+- --output-dir (default RFM/v2/phase2/artifacts)
+- --model-size (default 8b)
+- --max-rounds (default 3)
+- --self-history-budget (default 10)
+- --one-hop-budget (default 10)
+- --multi-hop-budget-total (default 50)
+- --neighbor-budget (default 10)
+- --strict-json (default true)
+- --dry-run (optional)
+
+2.2 Phase 1 Artifacts
+From: <phase1-artifacts-dir>/<dataset>/
+- schema.json
+- stats.json
+- semantics.json
+- path_catalog.json
+- safety_rules.json
+
+2.3 Task Metadata
+- entity_table, entity_col, time_col, output_col
+- target type (regression/classification) inferred
+- cutoff semantics inherited from safety_rules/global cutoff
+
+==================================================
+3) OUTPUT CONTRACT
+==================================================
+Primary file:
+- <output-dir>/<dataset>/<task>/task_spec.json
+
+Recommended supporting files:
+- solver_rounds.jsonl          (raw solver proposals per round)
+- critic_rounds.jsonl          (critic findings per round)
+- final_validation_report.json
+
+3.1 task_spec.json structure
+- artifact_version
+- dataset_name
+- task_name
+- generation_timestamp_utc
+- source_artifacts
+- task_definition
+  - entity_table
+  - entity_col
+  - time_col
+  - output_col
+  - task_type
+- path_scoring_rules
+  - selection_filters
+  - ranking_formula
+  - path_exclusions
+- feature_rules
+  - allowed_aggregations
+  - temporal_features
+  - trend_features
+  - blocked_features
+- depth_policy
+  - default_max_depth
+  - escalation_conditions
+- budget_policy
+  - self_history_budget
+  - one_hop_budget
+  - multi_hop_budget_total
+  - neighbor_budget
+- safety_constraints
+  - temporal_cutoff_rule
+  - leakage_prevention_rules
+  - forbidden_columns
+- solver_critic_diagnostics
+  - rounds
+  - major_issues_count
+  - stop_reason
+  - model_name
+- validation
+  - schema_valid
+  - consistency_checks
+  - warnings
+
+==================================================
+4) PHASE 2 PIPELINE (EXECUTION FLOW)
+==================================================
+Step A: Load and Validate Inputs
+1. Parse CLI and resolve paths.
+2. Load Phase 1 artifacts.
+3. Validate required keys in each artifact.
+4. Load task metadata from RelBench task object.
+
+Step B: Build Compilation Context
+1. Build compact task context block:
+   - task definition
+   - entity/target/time info
+2. Build dataset-aware evidence block from Phase 1:
+   - recommended paths only (default)
+   - path costs/risks
+   - semantic labels
+   - safety constraints
+3. Build budget/depth defaults from CLI + policy.
+
+Step C: Solver Round (LLM)
+1. Prompt solver to produce STRICT JSON proposal:
+   - path scoring rules
+   - feature rules
+   - depth policy
+   - budget policy
+   - safety constraints
+2. Parse and validate JSON.
+3. If parse fails, retry with repair prompt (bounded retries).
+
+Step D: Critic Round (LLM)
+1. Prompt critic with solver proposal + context.
+2. Critic outputs STRICT JSON findings:
+   - leakage risks
+   - high-cardinality path risks
+   - weak semantic links
+   - sparse-self-history handling gaps
+   - severity: major/minor
+   - targeted fixes
+
+Step E: Revision Loop
+1. If critic major issues exist and round < max_rounds:
+   - pass findings to solver for revision.
+2. Else early-stop.
+3. Repeat up to max_rounds (default 3).
+
+Step F: Finalization
+1. Normalize final proposal to canonical schema.
+2. Run deterministic validators.
+3. Write task_spec.json + diagnostics files.
+
+==================================================
+5) SOLVER/CRITIC PROMPT DESIGN
+==================================================
+5.1 Shared rules
+- Output JSON only
+- Enums constrained
+- No prose
+- No unsupported keys
+- Use dataset-aware but task-agnostic principles
+
+5.2 Solver requirements
+- Must reference:
+  - safety cutoff from Phase 1
+  - recommended path set
+  - budget defaults
+- Must define fallback for sparse self-history
+- Must preserve low-confidence FK exclusion default
+
+5.3 Critic rubric
+- Temporal leakage check
+- Cardinality explosion check
+- Semantic coherence check
+- Budget realism check
+- Path-depth policy consistency
+- Completeness of safety constraints
+
+==================================================
+6) VALIDATION LAYER (PROGRAMMATIC)
+==================================================
+6.1 JSON Schema validation
+- strict required fields
+- enum checks
+- type checks
+
+6.2 Consistency checks
+- selected paths exist in path_catalog.json
+- excluded low-confidence links by default
+- feature rules only use allowed transformations
+- depth policy numeric bounds valid
+- budgets non-negative and within practical ranges
+- safety cutoff matches Phase 1 cutoff
+
+6.3 Diagnostics checks
+- round count <= max_rounds
+- stop_reason present
+- major/minor issue counters present
+
+==================================================
+7) DEFAULT POLICY CONTENT
+==================================================
+- path filters:
+  - include recommended paths
+  - exclude low-confidence inferred FK paths
+  - respect temporal validity
+- ranking signals:
+  - semantic relevance
+  - proximity/depth
+  - cardinality risk
+  - leakage risk penalty
+- feature transforms allowed:
+  - count, mean, min, max, std, sum
+  - recency stats
+  - trend/delta where available
+- disallow:
+  - future-derived columns
+  - direct leakage indicators
+
+==================================================
+8) FAILURE HANDLING
+==================================================
+- LLM parse failure:
+  - retry with repair prompt (bounded)
+  - if still failing, stop with actionable error
+- Artifact mismatch/missing keys:
+  - fail fast with explicit missing paths/fields
+- Critic loop non-convergence:
+  - emit best valid round + warnings + stop_reason="max_rounds_reached"
+
+==================================================
+9) IMPLEMENTATION MODULES
+==================================================
+Suggested files in RFM/v2/phase2/
+- phase2_pipeline.py              (entrypoint)
+- phase2_models.py                (dataclasses/schemas)
+- phase2_prompts.py               (solver/critic prompts)
+- phase2_validation.py            (schema + consistency checks)
+- phase2_io.py                    (artifact loading/writing)
+- phase2_llm.py                   (local LLM wrappers/retries)
+
+==================================================
+10) ACCEPTANCE CRITERIA
+==================================================
+Phase 2 is complete when:
+1. Running CLI for one task produces task_spec.json.
+2. task_spec.json passes schema validation.
+3. Safety cutoff rule is preserved from Phase 1.
+4. Low-confidence FK paths are excluded by default.
+5. Solver-critic diagnostics captured with <=3 rounds.
+6. Output policy is executable and internally consistent.
+
+==================================================
+11) FIRST IMPLEMENTATION MILESTONES
+==================================================
+M1: skeleton + IO + validators
+M2: solver-only compile path
+M3: critic + loop + early stop
+M4: final schema + diagnostics export
+M5: smoke test on rel-f1 / one task (e.g., driver-position)

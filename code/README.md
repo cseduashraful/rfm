@@ -410,6 +410,29 @@ generic static-attribute similarity and includes:
 This path is database-agnostic in design and does not require task labels, but
 it is off by default.
 
+### FastDFS / DFS Flag
+
+The zero-shot CLI supports FastDFS-based relational feature summaries:
+
+```bash
+python code/zero_shot.py --use-dfs
+```
+
+Backward-compatible alias:
+
+```bash
+python code/zero_shot.py --use-fastdfs
+```
+
+When enabled:
+
+- FastDFS features are computed per prompt entry timestamp
+  (each history example timestamp plus the final query timestamp).
+- Cutoff time is enforced in strict mode (`timestamp - 1ns`) to avoid temporal
+  leakage from same-timestamp rows.
+- Raw DFS columns are not injected directly; instead, prompts include
+  human-readable summaries grouped by meta-path.
+
 ### Batching and Streaming
 
 The current zero-shot runtime uses a two-stage pipeline:

@@ -1,0 +1,139 @@
+environment: ~/envs/llm
+Pytorch/pyg/relbench
+
+
+To fully implement Phase 1 end-to-end, I need these concrete specs:
+
+Target DB interface
+Exact DuckDB source path(s), and whether there’s one DB or many. 
+-- for now use just relbench f1. but i should be able to use other relbench datasets also.
+Whether we can execute arbitrary SQL over all tables.
+-- yes
+
+Scale and runtime budget
+Max runtime for Phase 1 (for rel-f1 and future datasets).
+Memory/CPU limits.
+--assume 128G ram and 8 cpu cores
+
+Whether sampling is allowed for expensive stats/correlations.
+-- yes
+
+PK/FK ground truth policy
+Should PK/FK be inferred only, or also accepted from manual overrides?
+--if the db does not comes with pk-fk, then you need to infer
+
+How to handle ambiguous keys (composite keys, weak FKs).
+--Add your ideas here
+
+Temporal semantics
+Which columns count as valid event time if multiple timestamp columns exist.
+--for now rel-bench has time cols specified. if no time col, that is static information, make use of that. if multiple time cols, mention that. solver-critic will figure that idea.
+
+Cutoff policy for “temporal validity” in path checks.
+--ensure no temporal leakgae. relbench comes with test starting time, no information beyond val starting time should be visible to phase 1. or to solver critique.
+
+Path catalog rules
+
+Max join depth D (you suggested 3, confirm).
+--here long, depth limiting will be for phase 2. allow long paths like 6-8
+
+Allowed join types (inner only? left joins?).
+--inner an left join
+
+Cardinality explosion thresholds (hard cutoffs).
+--keep it manageable within llama 8b, a40/l40s gpu and 128g Ram
+
+Statistical profiling scope
+Which stats are mandatory vs optional:
+-pdf/cdf params and mode, max, min are mandatory,
+
+missingness, distributions, temporal coverage, correlations, join explosion.
+--add your recommendations here
+
+Correlation method and caps (numeric-only? top-k pairs?).
+--Add your recommendations here
+
+LLM semantic annotation details
+Model/provider to use for Phase 1 LLM labeling.
+--for starting i will test with llma 8b. if the results re promising, then i will move to larger model later.
+
+Prompt/output format (strict JSON schema).
+-- which ever format is easy for llms
+
+Determinism settings (temperature, retries, validation).
+-- what is this?
+
+Safety/leakage policy
+Definition of leakage columns (name patterns + rule-based checks).
+-- for phase 1/2 no information beyond val start time should be visible.
+Whether to allow a manual denylist/allowlist.
+-- Nothing should be manual
+
+
+Artifact contract
+Final JSON schemas for:
+schema.json, stats.json, semantics.json, path_catalog.json, safety_rules.json.
+Versioning format (artifact_version, dataset hash, timestamps).
+Quality checks
+What constitutes “Phase 1 complete”:
+required fields present
+schema validation pass
+minimum coverage thresholds
+reproducibility checks.
+If you want, I can draft a Phase 1 spec file with sensible defaults for all 10 so you only need to edit a few fields.
+
+--------------------------------------------------
+FOLLOW-UP DECISIONS (CONFIRMED)
+--------------------------------------------------
+
+Should Phase 1 run with one global cutoff (val_start) for all tasks in a dataset?
+-- yes
+
+For low-confidence inferred FKs, should they be excluded by default from "recommended paths" but kept in full catalog?
+-- yes for now
+
+Is sampled profiling acceptable as default for very large tables, with a sampled=true flag in artifacts?
+-- yes
+
+--------------------------------------------------
+DEFAULTS/RECOMMENDATIONS TO USE NOW
+--------------------------------------------------
+
+How to handle ambiguous keys (composite keys, weak FKs).
+-- infer candidate PK/FK using:
+   1) type compatibility
+   2) overlap ratio
+   3) uniqueness / near-uniqueness
+   4) temporal consistency where applicable
+-- assign confidence: high / medium / low
+-- keep all in full catalog, but low-confidence FKs are excluded from recommended paths by default
+
+Statistical profiling scope (recommendations).
+-- Mandatory:
+   - missingness
+   - min/max/mode
+   - mean/std/median
+   - quantiles (p10, p25, p50, p75, p90)
+   - distribution summaries (histogram for numeric, top-k frequencies for categorical)
+   - temporal coverage
+   - join fanout / join explosion estimates
+-- Optional:
+   - skewness/kurtosis
+   - outlier rate (IQR-based)
+   - drift over time buckets
+
+Correlation method and caps (recommendations).
+-- numeric-numeric: Spearman
+-- categorical-categorical: Cramer's V
+-- numeric-categorical: effect-size/MI style score
+-- cap to top-k strongest pairs per table and global max pair budget
+-- allow sampling for large tables and record sampled=true + sample_size
+
+Determinism settings (clarification).
+-- this means reproducible LLM annotation behavior
+-- use:
+   - temperature=0
+   - top_p=1
+   - strict JSON output validation
+   - bounded retries on parse failure (e.g., 2 retries)
+   - fixed seed if provider supports it

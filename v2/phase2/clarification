@@ -1,0 +1,43 @@
+
+Input artifact location
+Should Phase 2 read from RFM/v2/phase1/artifacts/<dataset>/ by default?
+--yes, dataset name will be passed in the cli. default is rel-f1
+
+Task scope
+Run Phase 2 for:
+one task at a time (--task driver-position), or
+all tasks in dataset by default?
+--one task at a time.
+
+Solver/Critic model
+Use local Llama 8B for both solver and critic (same infra as Phase 1)?
+-- yes. solver critique will go on for multiple iteration. model can be selected via cli. 8b is default.
+
+
+Output format
+Confirm task_spec.json schema should include:
+task definition,
+path scoring rules,
+feature rules,
+depth policy,
+budget policy,
+safety constraints,
+solver/critic diagnostics.
+Policy strictness
+
+
+Should low-confidence FK paths remain excluded by default in Phase 2 recommended plan? (I assume yes)
+yes 
+
+
+Budget defaults
+Please confirm defaults:
+self history budget, --def 10
+1-hop budget, -- 10
+multi-hop budget, -- each hop combined 50
+neighbor budget. -- 10, 
+Round control
+Keep solver-critic at max 3 rounds with early stop when critic finds no major issues? (I assume yes)
+--yes
+If you confirm these, I’ll implement Phase 2 end-to-end in RFM/v2/phase2/.
+

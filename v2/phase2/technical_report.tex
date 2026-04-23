@@ -1,0 +1,93 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{hyperref}
+\usepackage{enumitem}
+\title{Phase 2 Technical Report: Task-Specific Meta-Path Compilation}
+\author{RFM v2 Phase 2}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\section{Objective}
+Phase 2 consumes Phase 1 artifacts and a task definition, then compiles a task-specific policy: selected meta-paths, attribute priorities, aggregation hints, and operational budgets.
+
+\section{Inputs and Outputs}
+\textbf{Inputs}: dataset name, task name, Phase 1 artifact directory, LLM model.
+
+\textbf{Outputs} under \texttt{<output-dir>/<dataset>/<task>/}:
+\begin{itemize}[leftmargin=1.5em]
+  \item \texttt{task\_spec.json}
+  \item \texttt{final\_validation\_report.json}
+  \item \texttt{solver\_rounds.jsonl}
+  \item \texttt{critic\_rounds.jsonl}
+\end{itemize}
+
+\section{Refactored Module Layout}
+\begin{itemize}[leftmargin=1.5em]
+  \item \texttt{phase2\_pipeline.py}: orchestration, context assembly, solver-critic loop.
+  \item \texttt{phase2\_policy.py}: selection sanitization, finalization, aggregation-plan build, policy merge.
+  \item \texttt{phase2\_rescoring.py}: LLM-based candidate path rescoring and fallback parsing.
+  \item \texttt{phase2\_prompts.py}: solver and critic prompt templates.
+  \item \texttt{phase2\_llm.py}: local JSON-oriented chat generation wrapper.
+  \item \texttt{phase2\_io.py}, \texttt{phase2\_validation.py}: artifact IO and schema/consistency checks.
+\end{itemize}
+
+\section{Compilation Procedure}
+\begin{enumerate}[leftmargin=1.8em]
+  \item Load Phase 1 artifacts including \texttt{semantic\_context\_graph.json}.
+  \item Build candidate meta-paths from anchor table over semantic graph edges.
+  \item Score candidate paths with an LLM-based relevance pass.
+  \item Run solver-critic iterations to refine selected paths and policy fields.
+  \item Apply deterministic finalization (anchor/depth/diversity constraints).
+  \item Emit final \texttt{task\_spec.json} and validation report.
+\end{enumerate}
+
+\section{Rescoring Design}
+The rescoring module supports robust JSON variability:
+\begin{itemize}[leftmargin=1.5em]
+  \item accepts multiple output shapes (list/map/alternate keys);
+  \item path-id normalization (e.g., \texttt{p1}, \texttt{P0001}, embedded IDs);
+  \item order-based fallback when IDs are malformed or omitted;
+  \item compact second-pass fallback returning a numeric relevance list.
+\end{itemize}
+
+\section{Selection Policy}
+Current selection behavior combines:
+\begin{itemize}[leftmargin=1.5em]
+  \item LLM task relevance,
+  \item structural priors (depth/cardinality),
+  \item directness and dominated-path suppression,
+  \item safety defaults (exclude low-confidence links by default).
+\end{itemize}
+
+\section{Diagnostics}
+Console diagnostics expose:
+\begin{itemize}[leftmargin=1.5em]
+  \item semantic graph usage summary,
+  \item SQL hint coverage,
+  \item LLM rescoring stats (scored/matched/returned/batch failures),
+  \item solver-critic per-round status and issue summaries,
+  \item final top selected paths with relevance scores.
+\end{itemize}
+
+\section{Extensibility}
+\begin{itemize}[leftmargin=1.5em]
+  \item Replace/extend path rescoring in \texttt{phase2\_rescoring.py}.
+  \item Swap selection/finalization rules in \texttt{phase2\_policy.py}.
+  \item Add prompt constraints in \texttt{phase2\_prompts.py} without changing orchestration.
+  \item Add validation invariants in \texttt{phase2\_validation.py}.
+\end{itemize}
+
+\section{Reproducibility}
+\begin{verbatim}
+python phase2/phase2_pipeline.py \
+  --dataset rel-f1 \
+  --task driver-position \
+  --phase1-artifacts-dir phase1/artifacts \
+  --output-dir phase2/artifacts \
+  --model-size 8b \
+  --max-rounds 5
+\end{verbatim}
+
+\end{document}

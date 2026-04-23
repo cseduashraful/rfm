@@ -1,13 +1,21 @@
 from __future__ import annotations
 
 import argparse
+import cProfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, field
+from pathlib import Path
 from queue import Queue
+from threading import Lock
 import threading
+import pstats
+from time import perf_counter
+from typing import Any
 import warnings
 
 import numpy as np
 import pandas as pd
+import torch
 
 from load_inference_config import build_parser, load_and_validate_inference_config
 from fastdfs_context import build_fastdfs_context_builder
@@ -34,6 +42,52 @@ warnings.filterwarnings(
     category=UserWarning,
     module=r"featuretools\.entityset\.entityset",
 )
+
+
+@dataclass
+class PhaseTimer:
+    enabled: bool = True
+    _phase_durations: dict[str, list[float]] = field(default_factory=dict)
+    _lock: Lock = field(default_factory=Lock)
+
+    def add(self, phase: str, duration_s: float) -> None:
+        if not self.enabled:
+            return
+        with self._lock:
+            self._phase_durations.setdefault(phase, []).append(duration_s)
+
+    def summary_rows(self) -> list[dict[str, Any]]:
+        rows = []
+        for phase, durations in self._phase_durations.items():
+            if not durations:
+                continue
+            arr = np.array(durations, dtype=float)
+            rows.append(
+                {
+                    "phase": phase,
+                    "count": int(arr.size),
+                    "total_s": float(arr.sum()),
+                    "avg_s": float(arr.mean()),
+                    "p50_s": float(np.percentile(arr, 50)),
+                    "p95_s": float(np.percentile(arr, 95)),
+                    "max_s": float(arr.max()),
+                }
+            )
+        rows.sort(key=lambda row: row["total_s"], reverse=True)
+        return rows
+
+    def total_for_phase(self, phase: str) -> float:
+        with self._lock:
+            durations = self._phase_durations.get(phase, [])
+            return float(sum(durations))
+
+    def total_for_prefix(self, prefix: str) -> float:
+        with self._lock:
+            total = 0.0
+            for phase, durations in self._phase_durations.items():
+                if phase.startswith(prefix):
+                    total += float(sum(durations))
+            return total
 
 
 def extend_parser() -> argparse.ArgumentParser:
@@ -106,13 +160,13 @@ def extend_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--context-workers",
         type=int,
-        default=4,
+        default=1,
         help="Number of workers to use when preparing prompts across examples and within each prompt context.",
     )
     parser.add_argument(
         "--frontier-workers",
         type=int,
-        default=4,
+        default=1,
         help="Number of workers to use when expanding frontier nodes within a hop.",
     )
     parser.add_argument(
@@ -171,7 +225,7 @@ def extend_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--prep-queue-size",
         type=int,
-        default=8,
+        default=4,
         help="Number of prepared prompt batches to buffer ahead in overlap mode.",
     )
     parser.add_argument(
@@ -262,6 +316,85 @@ def extend_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Rebuild the zero-shot dataset-history disk cache before inference.",
     )
+    parser.add_argument(
+        "--profile",
+        dest="profile",
+        action="store_true",
+        default=True,
+        help="Enable lightweight phase timing and summary output.",
+    )
+    parser.add_argument(
+        "--no-profile",
+        dest="profile",
+        action="store_false",
+        help="Disable lightweight profiling for clean runs.",
+    )
+    parser.add_argument(
+        "--profile-print-items",
+        action="store_true",
+        help="Print per-item timing details during inference.",
+    )
+    parser.add_argument(
+        "--profile-slowest-items",
+        type=int,
+        default=10,
+        help="Number of slowest items to print in the final profile summary.",
+    )
+    parser.add_argument(
+        "--enable-cprofile",
+        action="store_true",
+        help="Enable Python cProfile and print top functions at the end.",
+    )
+    parser.add_argument(
+        "--cprofile-sort",
+        choices=["cumulative", "tottime", "calls"],
+        default="cumulative",
+        help="Sort key for cProfile function stats.",
+    )
+    parser.add_argument(
+        "--cprofile-top-n",
+        type=int,
+        default=40,
+        help="How many cProfile rows to print.",
+    )
+    parser.add_argument(
+        "--cprofile-output",
+        type=str,
+        default=None,
+        help="Optional output path to save raw cProfile stats (.prof).",
+    )
+    parser.add_argument(
+        "--enable-torch-profiler",
+        action="store_true",
+        help="Save PyTorch profiler traces for non-LLM prepare_item work only.",
+    )
+    parser.add_argument(
+        "--torch-profiler-dir",
+        type=str,
+        default="artifacts/torch_profile",
+        help="Directory where prepare-item PyTorch traces will be saved.",
+    )
+    parser.add_argument(
+        "--torch-profiler-max-items",
+        type=int,
+        default=10,
+        help="Maximum number of prepare_item traces to export.",
+    )
+    parser.add_argument(
+        "--torch-profiler-record-shapes",
+        action="store_true",
+        help="Record tensor shapes in PyTorch profiler traces.",
+    )
+    parser.add_argument(
+        "--torch-profiler-profile-memory",
+        action="store_true",
+        help="Record memory events in PyTorch profiler traces.",
+    )
+    parser.add_argument(
+        "--torch-profiler-with-stack",
+        action="store_true",
+        help="Record Python stack traces in PyTorch profiler output.",
+    )
     return parser
 
 
@@ -282,8 +415,7 @@ def _parse_context_components(raw: str) -> set[str]:
     return selected
 
 
-def main() -> None:
-    args = extend_parser().parse_args()
+def run(args: argparse.Namespace) -> None:
     if args.self_example_max_count is not None and args.self_example_max_count < 0:
         raise ValueError("--self-example-max-count must be >= 0.")
     if args.other_example_max_count is not None and args.other_example_max_count < 0:
@@ -303,20 +435,39 @@ def main() -> None:
     if args.history_sampling_strategy is not None:
         config["history_sampling_strategy"] = args.history_sampling_strategy
 
+    timers = PhaseTimer(enabled=args.profile)
+    prepare_item_stats: list[dict[str, Any]] = []
+    prepare_item_lock = Lock()
+    global_start = perf_counter()
+    torch_profile_reservation_lock = Lock()
+    torch_profile_saved_lock = Lock()
+    torch_profile_saved_paths: list[str] = []
+    torch_profile_next_slot = 0
+
+    t0 = perf_counter()
     resource = build_inference_resource(
         config,
         no_dataset_download=args.no_dataset_download,
         no_task_download=args.no_task_download,
     )
+    timers.add("setup.build_inference_resource", perf_counter() - t0)
+
+    t0 = perf_counter()
     store, _ = build_history_store_with_options(
         resource,
         force_rebuild=args.force_history_cache_rebuild,
         verbose=args.print_log,
     )
+    timers.add("setup.build_history_store", perf_counter() - t0)
+
     graph_store = RelBenchGraphRAGStore()
+    t0 = perf_counter()
     graph_store.build_base(resource.db, resource.task_object)
+    timers.add("setup.graph_store.build_base", perf_counter() - t0)
     graph_store.parallel_frontier_workers = max(1, args.frontier_workers)
+    t0 = perf_counter()
     extractor = RowFeatureExtractor(resource.db, graph_store)
+    timers.add("setup.row_feature_extractor", perf_counter() - t0)
     context_components = _parse_context_components(args.context_components)
     include_neighbors = "neighbors" in context_components
     include_dfs_summary = "dfs" in context_components
@@ -324,14 +475,23 @@ def main() -> None:
     effective_use_dfs = args.use_dfs and (include_dfs_summary or include_dfs_table)
     dfs_context_builder = None
     if effective_use_dfs:
+        t0 = perf_counter()
         dfs_context_builder = build_fastdfs_context_builder(resource)
-    llm = LocalLLM(MODEL_PATHS[args.model_size], print_log=args.print_log)
+        timers.add("setup.fastdfs_context_builder", perf_counter() - t0)
 
+    t0 = perf_counter()
+    llm = LocalLLM(MODEL_PATHS[args.model_size], print_log=args.print_log)
+    timers.add("setup.load_llm", perf_counter() - t0)
+
+    t0 = perf_counter()
     eval_table = resource.task_object.get_table("test", mask_input_cols=False)
+    timers.add("setup.load_eval_table_test", perf_counter() - t0)
     if resource.output_col not in eval_table.df.columns:
         if args.print_log:
             print("using val for evaluation since test has no labels")
+        t0 = perf_counter()
         eval_table = resource.task_object.get_table("val", mask_input_cols=False)
+        timers.add("setup.load_eval_table_val", perf_counter() - t0)
 
     eval_max_time = eval_table.df[resource.time_col].max()
     if resource.db.max_timestamp < eval_max_time:
@@ -355,6 +515,9 @@ def main() -> None:
             print(f"dfs_training_window_key={dfs_context_builder.training_window_key}")
         print(f"context_components={','.join(sorted(context_components)) or 'none'}")
         print(f"recent_context_k={args.recent_context_k}")
+        print(f"profile={args.profile}")
+        print(f"enable_cprofile={args.enable_cprofile}")
+        print(f"enable_torch_profiler={args.enable_torch_profiler}")
         print(f"overlap_prep_llm={args.overlap_prep_llm}")
         print(f"bulk_history_query={args.bulk_history_query}")
         print(f"pipeline_batch_size={args.pipeline_batch_size}")
@@ -363,6 +526,17 @@ def main() -> None:
         print(f"other_neighbor_entity_count={args.other_neighbor_entity_count}")
         print(f"other_neighbor_history_count={args.other_neighbor_history_count}")
         print(f"other_neighbor_search_hops={args.other_neighbor_search_hops}")
+
+    torch_profile_enabled = bool(args.enable_torch_profiler)
+    torch_profile_limit = max(0, int(args.torch_profiler_max_items))
+    torch_profile_dir = Path(args.torch_profiler_dir)
+    if torch_profile_enabled and torch_profile_limit > 0:
+        torch_profile_dir.mkdir(parents=True, exist_ok=True)
+    elif torch_profile_enabled and torch_profile_limit == 0:
+        print(
+            "torch profiler is enabled but --torch-profiler-max-items=0, "
+            "so no traces will be collected."
+        )
 
     predictions = []
     targets = []
@@ -417,19 +591,30 @@ def main() -> None:
     )
     dfs_super_batch_size = dfs_batch_size if effective_use_dfs else pipeline_batch_size
 
-    def dfs_cache_key(row_dict):
+    def _reserve_torch_profile_slot() -> int | None:
+        nonlocal torch_profile_next_slot
+        if not torch_profile_enabled or torch_profile_limit <= 0:
+            return None
+        with torch_profile_reservation_lock:
+            if torch_profile_next_slot >= torch_profile_limit:
+                return None
+            reserved_slot = torch_profile_next_slot
+            torch_profile_next_slot += 1
+            return reserved_slot
+
+    def _dfs_cache_key(row_dict: dict[str, Any]) -> tuple[str, int]:
         return (
             str(row_dict[resource.entity_col]),
             int(pd.Timestamp(row_dict[resource.time_col]).value),
         )
 
-    def history_key(record):
+    def _history_key(record: dict[str, Any]) -> tuple[str, int]:
         return (
             str(record[resource.entity_col]),
             int(pd.Timestamp(record[resource.time_col]).value),
         )
 
-    def entity_key(value):
+    def _entity_key(value: Any) -> str:
         if value is None:
             return ""
         if isinstance(value, (np.integer, int)):
@@ -443,11 +628,15 @@ def main() -> None:
             return str(value_f)
         return str(value).strip()
 
-    def select_self_history_by_window(rows, query_time, window_ns):
+    def _select_self_history_by_window(
+        rows: list[dict[str, Any]],
+        query_time: Any,
+        window_ns: int,
+    ) -> list[dict[str, Any]]:
         if window_ns <= 0 or len(rows) <= 1:
             return rows
         query_ts_ns = int(pd.Timestamp(query_time).value)
-        selected_by_bucket = {}
+        selected_by_bucket: dict[int, dict[str, Any]] = {}
         for row in sorted(rows, key=lambda r: pd.Timestamp(r[resource.time_col]), reverse=True):
             ts_ns = int(pd.Timestamp(row[resource.time_col]).value)
             if ts_ns > query_ts_ns:
@@ -458,13 +647,13 @@ def main() -> None:
                 selected_by_bucket[bucket] = row
         return sorted(selected_by_bucket.values(), key=lambda r: pd.Timestamp(r[resource.time_col]))
 
-    def select_other_entity_examples(
-        entity_value,
-        cutoff_time,
-        max_rows,
-        neighbor_entity_count,
-        neighbor_history_count,
-    ):
+    def _select_other_entity_examples(
+        entity_value: Any,
+        cutoff_time: Any,
+        max_rows: int,
+        neighbor_entity_count: int,
+        neighbor_history_count: int,
+    ) -> list[dict[str, Any]]:
         if (
             max_rows <= 0
             or neighbor_entity_count <= 0
@@ -473,15 +662,15 @@ def main() -> None:
         ):
             return []
         cutoff_ts = pd.Timestamp(cutoff_time)
-        query_entity_key = entity_key(entity_value)
+        query_entity_key = _entity_key(entity_value)
         pool = example_pool_df[example_pool_df[resource.time_col] <= cutoff_ts].copy()
-        pool["__entity_key"] = pool[resource.entity_col].map(entity_key)
+        pool["__entity_key"] = pool[resource.entity_col].map(_entity_key)
         pool = pool[pool["__entity_key"] != query_entity_key]
         if pool.empty:
             return []
 
         # Rank nearby same-type entities via PK-FK graph.
-        neighbor_rank_by_entity = {}
+        neighbor_rank_by_entity: dict[str, tuple[int, int]] = {}
         start_node_id = graph_store.node_id_map.get((resource.entity_table, entity_value))
         if start_node_id is not None:
             graph_neighbors = graph_store.get_multihop_neighbors_before(
@@ -495,12 +684,12 @@ def main() -> None:
                 dst_table, dst_pk = graph_store.rev_node_id[dst_id]
                 if dst_table != resource.entity_table or dst_pk == entity_value:
                     continue
-                entity_key_value = entity_key(dst_pk)
+                entity_key = _entity_key(dst_pk)
                 hop = int(nbr.get("hop", 10**9))
                 ts_val = int(nbr.get("ts", -1))
-                prev = neighbor_rank_by_entity.get(entity_key_value)
+                prev = neighbor_rank_by_entity.get(entity_key)
                 if prev is None or hop < prev[0] or (hop == prev[0] and ts_val > prev[1]):
-                    neighbor_rank_by_entity[entity_key_value] = (hop, ts_val)
+                    neighbor_rank_by_entity[entity_key] = (hop, ts_val)
 
         if not neighbor_rank_by_entity:
             return []
@@ -513,7 +702,7 @@ def main() -> None:
         if not selected_entity_keys:
             return []
 
-        records = []
+        records: list[dict[str, Any]] = []
         for entity_key in selected_entity_keys:
             entity_rows = pool[pool["__entity_key"] == entity_key]
             if entity_rows.empty:
@@ -536,18 +725,20 @@ def main() -> None:
 
     def precompute_histories(indexed_prepare_rows):
         if not indexed_prepare_rows:
-            return {}
-        unique_requests = {}
+            return {}, {}
+
+        unique_requests: dict[tuple[str, int], tuple[Any, Any]] = {}
         for _, row in indexed_prepare_rows:
             record = row._asdict()
-            key = history_key(record)
+            key = _history_key(record)
             if key not in unique_requests:
                 unique_requests[key] = (
                     record[resource.entity_col],
                     record[resource.time_col],
                 )
 
-        history_by_key = {}
+        history_by_key: dict[tuple[str, int], list[dict[str, Any]]] = {}
+        timing_by_key: dict[tuple[str, int], dict[str, float]] = {}
         request_items = list(unique_requests.items())
         bulk_requests = [
             (request_id, entity_value, cutoff_time)
@@ -558,58 +749,98 @@ def main() -> None:
         }
 
         if args.bulk_history_query:
+            t0 = perf_counter()
             histories_by_request_id = build_inference_histories_bulk(
                 store,
                 resource,
                 bulk_requests,
             )
+            bulk_elapsed = perf_counter() - t0
+            if args.profile and request_items:
+                per_request = bulk_elapsed / len(request_items)
+                for _ in request_items:
+                    timers.add("prepare.build_inference_history", per_request)
+
             for request_id, history in histories_by_request_id.items():
-                history_by_key[request_id_to_key[request_id]] = history
+                key = request_id_to_key[request_id]
+                history_by_key[key] = history
+                timing_by_key[key] = {
+                    "history_s": bulk_elapsed / max(1, len(request_items)),
+                    "validate_s": 0.0,
+                }
             for key, _ in request_items:
                 history_by_key.setdefault(key, [])
-            return history_by_key
+                timing_by_key.setdefault(key, {"history_s": 0.0, "validate_s": 0.0})
+            return history_by_key, timing_by_key
 
         def fetch_one(item):
             key, (entity_value, cutoff_time) = item
+            t0 = perf_counter()
             history = build_inference_history(store, resource, entity_value, cutoff_time)
+            history_s = perf_counter() - t0
+            t0 = perf_counter()
             validate_history_non_overlap(history, resource, cutoff_time)
-            return key, history
-
+            validate_s = perf_counter() - t0
+            return key, history, history_s, validate_s
         if args.context_workers > 1 and len(request_items) > 1:
             max_workers = min(args.context_workers, len(request_items))
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
                 futures = [executor.submit(fetch_one, item) for item in request_items]
                 for future in as_completed(futures):
-                    key, history = future.result()
+                    key, history, history_s, validate_s = future.result()
                     history_by_key[key] = history
+                    timing_by_key[key] = {
+                        "history_s": history_s,
+                        "validate_s": validate_s,
+                    }
+                    if args.profile:
+                        timers.add("prepare.build_inference_history", history_s)
+                        timers.add("prepare.validate_history_non_overlap", validate_s)
         else:
             for item in request_items:
-                key, history = fetch_one(item)
+                key, history, history_s, validate_s = fetch_one(item)
                 history_by_key[key] = history
-        return history_by_key
+                timing_by_key[key] = {
+                    "history_s": history_s,
+                    "validate_s": validate_s,
+                }
+                if args.profile:
+                    timers.add("prepare.build_inference_history", history_s)
+                    timers.add("prepare.validate_history_non_overlap", validate_s)
+        return history_by_key, timing_by_key
 
     def precompute_dfs_summaries(base_items):
         if not effective_use_dfs or dfs_context_builder is None or not base_items:
             return {}
-        all_rows = []
+        all_rows: list[dict[str, Any]] = []
         for item in base_items:
             all_rows.extend(item["entry_rows"])
+        t0 = perf_counter()
         summaries = dfs_context_builder.summarize_rows(all_rows)
-        cached = {}
+        precompute_s = perf_counter() - t0
+        if args.profile:
+            timers.add("dfs.precompute_summaries", precompute_s)
+
+        cached: dict[tuple[str, int], list[str]] = {}
         for row_dict, summary_lines in zip(all_rows, summaries):
-            cached[dfs_cache_key(row_dict)] = summary_lines
+            cached[_dfs_cache_key(row_dict)] = summary_lines
         return cached
 
     def precompute_dfs_feature_dicts(base_items):
         if not (effective_use_dfs and include_dfs_table) or dfs_context_builder is None or not base_items:
             return {}
-        all_rows = []
+        all_rows: list[dict[str, Any]] = []
         for item in base_items:
             all_rows.extend(item["entry_rows"])
+        t0 = perf_counter()
         feature_dicts = dfs_context_builder.feature_dicts_for_rows(all_rows)
-        cached = {}
+        precompute_s = perf_counter() - t0
+        if args.profile:
+            timers.add("dfs.precompute_feature_table_rows", precompute_s)
+
+        cached: dict[tuple[str, int], dict[str, str]] = {}
         for row_dict, feature_dict in zip(all_rows, feature_dicts):
-            cached[dfs_cache_key(row_dict)] = feature_dict
+            cached[_dfs_cache_key(row_dict)] = feature_dict
         return cached
 
     def finalize_prompt(base_item, dfs_summary_cache, dfs_feature_cache):
@@ -619,14 +850,14 @@ def main() -> None:
             if dfs_context_builder is not None:
                 precomputed_entry_dfs_summaries = [
                     dfs_summary_cache.get(
-                        dfs_cache_key(row_dict),
+                        _dfs_cache_key(row_dict),
                         ["- DFS summary unavailable for this timestamp."],
                     )
                     for row_dict in base_item["entry_rows"]
                 ]
                 if include_dfs_table:
                     precomputed_entry_dfs_feature_dicts = [
-                        dfs_feature_cache.get(dfs_cache_key(row_dict), {})
+                        dfs_feature_cache.get(_dfs_cache_key(row_dict), {})
                         for row_dict in base_item["entry_rows"]
                     ]
             else:
@@ -635,41 +866,111 @@ def main() -> None:
                     for _ in base_item["entry_rows"]
                 ]
 
-        prompt = build_zero_shot_prompt(
-            store=graph_store,
-            extractor=extractor,
-            resource=resource,
-            query_row=base_item["record"],
-            history_rows=base_item["history"],
-            top_k=args.top_k,
-            num_hops=args.num_hops,
-            include_hop_aggregation=args.aggregate,
-            include_semantic_retrieval=args.semantic_retrieval,
-            use_dfs=effective_use_dfs,
-            dfs_context_builder=dfs_context_builder,
-            context_workers=max(1, args.context_workers),
-            precomputed_entry_dfs_summaries=precomputed_entry_dfs_summaries,
-            precomputed_entry_dfs_feature_dicts=precomputed_entry_dfs_feature_dicts,
-            recent_context_k=max(0, args.recent_context_k),
-            include_neighbors=include_neighbors,
-            include_dfs_summary=include_dfs_summary,
-            include_dfs_table=include_dfs_table,
-            other_neighbor_entity_count=other_neighbor_entity_count,
-            other_neighbor_history_count=other_neighbor_history_count,
-        )
+        prompt_s = 0.0
+        item_index = int(base_item["item_index"])
+        torch_profile_slot = _reserve_torch_profile_slot()
+        if torch_profile_slot is not None:
+            trace_path = torch_profile_dir / f"prepare_item_{item_index:06d}.json"
+            with torch.profiler.profile(
+                activities=[torch.profiler.ProfilerActivity.CPU],
+                record_shapes=args.torch_profiler_record_shapes,
+                profile_memory=args.torch_profiler_profile_memory,
+                with_stack=args.torch_profiler_with_stack,
+            ) as torch_profiler:
+                with torch.profiler.record_function("prepare/build_zero_shot_prompt"):
+                    t0 = perf_counter()
+                    prompt = build_zero_shot_prompt(
+                        store=graph_store,
+                        extractor=extractor,
+                        resource=resource,
+                        query_row=base_item["record"],
+                        history_rows=base_item["history"],
+                        top_k=args.top_k,
+                        num_hops=args.num_hops,
+                        include_hop_aggregation=args.aggregate,
+                        include_semantic_retrieval=args.semantic_retrieval,
+                        use_dfs=effective_use_dfs,
+                        dfs_context_builder=dfs_context_builder,
+                        context_workers=max(1, args.context_workers),
+                        precomputed_entry_dfs_summaries=precomputed_entry_dfs_summaries,
+                        precomputed_entry_dfs_feature_dicts=precomputed_entry_dfs_feature_dicts,
+                        recent_context_k=max(0, args.recent_context_k),
+                        include_neighbors=include_neighbors,
+                        include_dfs_summary=include_dfs_summary,
+                        include_dfs_table=include_dfs_table,
+                        other_neighbor_entity_count=other_neighbor_entity_count,
+                        other_neighbor_history_count=other_neighbor_history_count,
+                    )
+                    prompt_s = perf_counter() - t0
+            torch_profiler.export_chrome_trace(str(trace_path))
+            with torch_profile_saved_lock:
+                torch_profile_saved_paths.append(str(trace_path))
+        else:
+            t0 = perf_counter()
+            prompt = build_zero_shot_prompt(
+                store=graph_store,
+                extractor=extractor,
+                resource=resource,
+                query_row=base_item["record"],
+                history_rows=base_item["history"],
+                top_k=args.top_k,
+                num_hops=args.num_hops,
+                include_hop_aggregation=args.aggregate,
+                include_semantic_retrieval=args.semantic_retrieval,
+                use_dfs=effective_use_dfs,
+                dfs_context_builder=dfs_context_builder,
+                context_workers=max(1, args.context_workers),
+                precomputed_entry_dfs_summaries=precomputed_entry_dfs_summaries,
+                precomputed_entry_dfs_feature_dicts=precomputed_entry_dfs_feature_dicts,
+                recent_context_k=max(0, args.recent_context_k),
+                include_neighbors=include_neighbors,
+                include_dfs_summary=include_dfs_summary,
+                include_dfs_table=include_dfs_table,
+                other_neighbor_entity_count=other_neighbor_entity_count,
+                other_neighbor_history_count=other_neighbor_history_count,
+            )
+            prompt_s = perf_counter() - t0
+
+        history_s = float(base_item["timing"]["history_s"])
+        validate_s = float(base_item["timing"]["validate_s"])
+        prepare_total_s = history_s + validate_s + prompt_s
+        if args.profile:
+            timers.add("prepare.build_zero_shot_prompt", prompt_s)
+            timers.add("prepare.total", prepare_total_s)
+            with prepare_item_lock:
+                prepare_item_stats.append(
+                    {
+                        "item_index": item_index,
+                        "prepare_total_s": prepare_total_s,
+                        "history_s": history_s,
+                        "validate_s": validate_s,
+                        "prompt_s": prompt_s,
+                    }
+                )
+
         return {
             **base_item,
             "prompt": prompt,
+            "timing": {
+                "prepare_total_s": prepare_total_s,
+                "history_s": history_s,
+                "validate_s": validate_s,
+                "prompt_s": prompt_s,
+            },
         }
 
     def build_base_items_for_super_batch(indexed_prepare_rows):
-        history_by_key = precompute_histories(indexed_prepare_rows)
+        batch_start = perf_counter()
+        history_by_key, history_timing_by_key = precompute_histories(indexed_prepare_rows)
+        if args.profile:
+            timers.add("prepare.history_precompute_batch", perf_counter() - batch_start)
+
         base_items = []
         for item_index, row in indexed_prepare_rows:
             record = row._asdict()
-            key = history_key(record)
+            key = _history_key(record)
             full_self_history = [dict(history_row) for history_row in history_by_key.get(key, [])]
-            full_self_history = select_self_history_by_window(
+            full_self_history = _select_self_history_by_window(
                 full_self_history,
                 record[resource.time_col],
                 history_window_ns,
@@ -694,7 +995,7 @@ def main() -> None:
                     latest_self_ts = pd.Timestamp(self_history[-1][resource.time_col])
                 else:
                     latest_self_ts = pd.Timestamp(record[resource.time_col])
-                other_history = select_other_entity_examples(
+                other_history = _select_other_entity_examples(
                     record[resource.entity_col],
                     latest_self_ts,
                     other_limit,
@@ -706,9 +1007,10 @@ def main() -> None:
 
             history = self_history + other_history
             history.sort(key=lambda item: pd.Timestamp(item[resource.time_col]))
+            timing = history_timing_by_key.get(key, {"history_s": 0.0, "validate_s": 0.0})
             query_row = dict(record)
             query_row["__example_scope"] = "query"
-            entry_rows = history + [query_row]
+            entry_rows = [dict(history_row) for history_row in history] + [query_row]
             base_items.append(
                 {
                     "item_index": item_index,
@@ -719,6 +1021,12 @@ def main() -> None:
                     "history": history,
                     "entry_rows": entry_rows,
                     "target": record.get(resource.output_col),
+                    "timing": {
+                        "prepare_total_s": float(timing["history_s"]) + float(timing["validate_s"]),
+                        "history_s": float(timing["history_s"]),
+                        "validate_s": float(timing["validate_s"]),
+                        "prompt_s": 0.0,
+                    },
                 }
             )
 
@@ -748,9 +1056,20 @@ def main() -> None:
         if not llm_items:
             return
         # breakpoint()  # for debugging any issues in prompt preparation before LLM generation
+        llm_start = perf_counter()
+        # if args.print_log and not args.pred_only:
+        #     for item in llm_items:
+        #         print(item['prompt']) 
+        #         breakpoint()
         outputs = llm.generate_batch([item["prompt"] for item in llm_items])
+        llm_total_s = perf_counter() - llm_start
+        timers.add("llm.generate_batch_total", llm_total_s)
+        timers.add("llm.generate_batch_per_item", llm_total_s / max(1, len(llm_items)))
         for item, output in zip(llm_items, outputs):
+            parse_start = perf_counter()
             prediction = extract_number(output)
+            parse_s = perf_counter() - parse_start
+            timers.add("llm.extract_number", parse_s)
             target = item["target"]
             target_float = float(target) if target is not None else None
             large_gap = (
@@ -786,6 +1105,24 @@ def main() -> None:
             if target is not None:
                 targets.append(target_float)
 
+            if args.profile and args.profile_print_items:
+                timing = item.get("timing", {})
+                prepare_total = timing.get("prepare_total_s", 0.0)
+                history_s = timing.get("history_s", 0.0)
+                validate_s = timing.get("validate_s", 0.0)
+                prompt_s = timing.get("prompt_s", 0.0)
+                llm_share_s = llm_total_s / max(1, len(llm_items))
+                total_s = prepare_total + llm_share_s + parse_s
+                print(
+                    "[profile:item] "
+                    f"idx={item['item_index']} "
+                    f"prepare={prepare_total:.4f}s "
+                    f"(history={history_s:.4f}s, validate={validate_s:.4f}s, prompt={prompt_s:.4f}s) "
+                    f"llm_share={llm_share_s:.4f}s "
+                    f"parse={parse_s:.4f}s "
+                    f"total~={total_s:.4f}s"
+                )
+
     super_batches = []
     for super_start in range(0, len(eval_rows), dfs_super_batch_size):
         super_rows = eval_rows[super_start : super_start + dfs_super_batch_size]
@@ -806,9 +1143,9 @@ def main() -> None:
 
     if args.overlap_prep_llm:
         queue_size = max(1, int(args.prep_queue_size))
-        prompt_batch_queue: Queue = Queue(maxsize=queue_size)
+        prompt_batch_queue: Queue[Any] = Queue(maxsize=queue_size)
         sentinel = object()
-        producer_error = []
+        producer_error: list[BaseException] = []
 
         def producer() -> None:
             try:
@@ -822,7 +1159,7 @@ def main() -> None:
                             base_chunk, dfs_summary_cache, dfs_feature_cache
                         )
                         prompt_batch_queue.put(prompt_items)
-            except BaseException as exc:
+            except BaseException as exc:  # pragma: no cover
                 producer_error.append(exc)
             finally:
                 prompt_batch_queue.put(sentinel)
@@ -853,6 +1190,8 @@ def main() -> None:
                 )
                 consume_prompt_items(prompt_items)
 
+    timers.add("pipeline.total_runtime", perf_counter() - global_start)
+
     if predictions and len(predictions) == len(targets):
         mae = np.mean(np.abs(np.array(predictions, dtype=float) - np.array(targets, dtype=float)))
         print(f"\nFinal MAE: {mae}")
@@ -860,6 +1199,83 @@ def main() -> None:
         print("\nPredictions generated, but no labels were available for MAE.")
     else:
         print("\nNo predictions generated.")
+
+    if args.profile:
+        print("\nTiming Summary (seconds)")
+        print("phase,count,total,avg,p50,p95,max")
+        for row in timers.summary_rows():
+            print(
+                f"{row['phase']},{row['count']},{row['total_s']:.4f},{row['avg_s']:.4f},"
+                f"{row['p50_s']:.4f},{row['p95_s']:.4f},{row['max_s']:.4f}"
+            )
+
+        pipeline_total_s = timers.total_for_phase("pipeline.total_runtime")
+        llm_generate_s = timers.total_for_phase("llm.generate_batch_total")
+        llm_parse_s = timers.total_for_phase("llm.extract_number")
+        llm_total_s = llm_generate_s + llm_parse_s
+        non_llm_visible_s = max(0.0, pipeline_total_s - llm_total_s)
+        setup_total_s = timers.total_for_prefix("setup.")
+        prepare_total_s = timers.total_for_phase("prepare.total")
+        dfs_total_s = timers.total_for_phase("dfs.precompute_summaries")
+        non_llm_actual_total_s = setup_total_s + dfs_total_s + prepare_total_s
+        # Estimated serial runtime if prep and LLM are not overlapped in the pipeline.
+        no_pipeline_overlap_expected_s = non_llm_actual_total_s + llm_total_s
+        processed_items = max(1, len(predictions))
+        per_item_total_inference_s = pipeline_total_s / processed_items
+
+        print("\nRuntime Summary (seconds)")
+        print(f"total_time={pipeline_total_s:.4f}")
+        print(f"pipeline_total={pipeline_total_s:.4f}")
+        print(f"llm_time={llm_total_s:.4f}")
+        print(f"non_llm_time={non_llm_visible_s:.4f}")
+        print(f"non_llm_actual_total={non_llm_actual_total_s:.4f}")
+        print(f"without_pipeline_expected_total={no_pipeline_overlap_expected_s:.4f}")
+        print(f"per_item_total_inference_time={per_item_total_inference_s:.4f}")
+
+        if prepare_item_stats:
+            sorted_items = sorted(
+                prepare_item_stats,
+                key=lambda x: x["prepare_total_s"],
+                reverse=True,
+            )
+            top_n = max(0, min(args.profile_slowest_items, len(sorted_items)))
+            if top_n > 0:
+                print(f"\nTop {top_n} Slowest prepare_item calls")
+                print("item_index,prepare_total,history,validate,prompt")
+                for item in sorted_items[:top_n]:
+                    print(
+                        f"{int(item['item_index'])},{item['prepare_total_s']:.4f},"
+                        f"{item['history_s']:.4f},{item['validate_s']:.4f},{item['prompt_s']:.4f}"
+                    )
+
+    if torch_profile_enabled:
+        print("\nPyTorch prepare-item traces")
+        print(f"requested_max_items={torch_profile_limit}")
+        print(f"saved_traces={len(torch_profile_saved_paths)}")
+        print(f"trace_dir={torch_profile_dir}")
+        if torch_profile_saved_paths and args.print_log:
+            for trace_path in torch_profile_saved_paths:
+                print(f"trace={trace_path}")
+
+
+def main() -> None:
+    args = extend_parser().parse_args()
+    if not args.enable_cprofile:
+        run(args)
+        return
+
+    profiler = cProfile.Profile()
+    try:
+        profiler.enable()
+        run(args)
+    finally:
+        profiler.disable()
+        print("\nPython cProfile Summary")
+        stats = pstats.Stats(profiler).sort_stats(args.cprofile_sort)
+        stats.print_stats(max(1, args.cprofile_top_n))
+        if args.cprofile_output:
+            profiler.dump_stats(args.cprofile_output)
+            print(f"cProfile stats saved to {args.cprofile_output}")
 
 
 if __name__ == "__main__":

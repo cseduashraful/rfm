@@ -23,6 +23,11 @@ class LocalLLM:
             trust_remote_code=True,
             local_files_only=True,
         )
+        # Decoder-only batched generation should use left padding.
+        self.tokenizer.padding_side = "left"
+        # Keep the most recent/rightmost prompt content when truncation is needed.
+        # This preserves query rows and strict output instructions in long DFS-table prompts.
+        self.tokenizer.truncation_side = "left"
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
         self.model = AutoModelForCausalLM.from_pretrained(
@@ -33,15 +38,65 @@ class LocalLLM:
             local_files_only=True,
         )
         self.model.eval()
+        self._numeric_token_ids: list[int] | None = None
+
+    def _get_numeric_token_ids(self) -> list[int]:
+        if self._numeric_token_ids is not None:
+            return self._numeric_token_ids
+
+        allowed_chars = set("0123456789+-.eE")
+        vocab_size = int(self.tokenizer.vocab_size)
+        allowed: list[int] = []
+        for token_id in range(vocab_size):
+            token_text = self.tokenizer.decode(
+                [token_id],
+                skip_special_tokens=False,
+                clean_up_tokenization_spaces=False,
+            )
+            if not token_text:
+                continue
+            if token_text.isspace():
+                continue
+            if all(ch in allowed_chars for ch in token_text):
+                allowed.append(token_id)
+
+        # Always allow EOS/PAD so generation can terminate.
+        eos_id = self.tokenizer.eos_token_id
+        if eos_id is not None and eos_id not in allowed:
+            allowed.append(eos_id)
+        pad_id = self.tokenizer.pad_token_id
+        if pad_id is not None and pad_id not in allowed:
+            allowed.append(pad_id)
+
+        if not allowed:
+            # Safety fallback to avoid hard failure.
+            allowed = [eos_id] if eos_id is not None else [0]
+        self._numeric_token_ids = allowed
+        return allowed
 
     def generate_batch(self, prompts: list[str], max_new_tokens: int = 20) -> list[str]:
         if not prompts:
             return []
 
-        normalized_prompts = [
-            "You must output a single number and nothing else.\n\n" + prompt
-            for prompt in prompts
-        ]
+        normalized_prompts = []
+        for prompt in prompts:
+            messages = [
+                {
+                    "role": "system",
+                    "content": "Return exactly one numeric value and nothing else.",
+                },
+                {"role": "user", "content": prompt},
+            ]
+            try:
+                rendered = self.tokenizer.apply_chat_template(
+                    messages,
+                    tokenize=False,
+                    add_generation_prompt=True,
+                )
+            except Exception:
+                rendered = "You must output a single number and nothing else.\n\n" + prompt
+            normalized_prompts.append(rendered)
+
         inputs = self.tokenizer(
             normalized_prompts,
             return_tensors="pt",
@@ -54,14 +109,81 @@ class LocalLLM:
                 **inputs,
                 max_new_tokens=max_new_tokens,
                 do_sample=False,
+                temperature=None,
+                top_p=None,
                 eos_token_id=self.tokenizer.eos_token_id,
                 pad_token_id=self.tokenizer.eos_token_id,
             )
 
-        input_lengths = inputs["attention_mask"].sum(dim=1).tolist()
+        prompt_token_len = inputs["input_ids"].shape[1]
         decoded = []
-        for row_idx, input_len in enumerate(input_lengths):
-            generated_tokens = outputs[row_idx][input_len:]
+        for row_idx in range(len(prompts)):
+            generated_tokens = outputs[row_idx][prompt_token_len:]
+            decoded.append(
+                self.tokenizer.decode(generated_tokens, skip_special_tokens=True)
+            )
+        return decoded
+
+    def generate_numeric_batch(self, prompts: list[str], max_new_tokens: int = 8) -> list[str]:
+        if not prompts:
+            return []
+
+        normalized_prompts = []
+        for prompt in prompts:
+            messages = [
+                {
+                    "role": "system",
+                    "content": (
+                        "Return exactly one numeric value only. "
+                        "No words, no code, no markdown."
+                    ),
+                },
+                {"role": "user", "content": prompt},
+            ]
+            try:
+                rendered = self.tokenizer.apply_chat_template(
+                    messages,
+                    tokenize=False,
+                    add_generation_prompt=True,
+                )
+            except Exception:
+                rendered = (
+                    "Return exactly one numeric value only.\n\n"
+                    + prompt
+                    + "\n\nAnswer:"
+                )
+            normalized_prompts.append(rendered)
+
+        inputs = self.tokenizer(
+            normalized_prompts,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+        ).to(self.model.device)
+
+        allowed_token_ids = self._get_numeric_token_ids()
+
+        def _prefix_allowed_tokens_fn(batch_id: int, input_ids: torch.Tensor) -> list[int]:
+            _ = batch_id, input_ids
+            return allowed_token_ids
+
+        with torch.no_grad():
+            outputs = self.model.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                min_new_tokens=1,
+                do_sample=False,
+                temperature=None,
+                top_p=None,
+                eos_token_id=self.tokenizer.eos_token_id,
+                pad_token_id=self.tokenizer.eos_token_id,
+                prefix_allowed_tokens_fn=_prefix_allowed_tokens_fn,
+            )
+
+        prompt_token_len = inputs["input_ids"].shape[1]
+        decoded = []
+        for row_idx in range(len(prompts)):
+            generated_tokens = outputs[row_idx][prompt_token_len:]
             decoded.append(
                 self.tokenizer.decode(generated_tokens, skip_special_tokens=True)
             )
@@ -69,5 +191,5 @@ class LocalLLM:
 
 
 def extract_number(text: str) -> float:
-    match = re.search(r"-?\d+(\.\d+)?", text)
+    match = re.search(r"[-+]?(?:\d*\.\d+|\d+)(?:[eE][-+]?\d+)?", text)
     return float(match.group()) if match else 0.0

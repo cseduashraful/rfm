@@ -1,0 +1,242 @@
+PHASE 1 DETAILED IMPLEMENTATION PLAN
+Relational DB Intelligence Extraction
+
+==================================================
+0) OBJECTIVE
+==================================================
+Build a robust, reusable Phase 1 pipeline that converts a RelBench DuckDB dataset
+into a Database Intelligence Bundle:
+- schema.json
+- stats.json
+- semantics.json
+- path_catalog.json
+- safety_rules.json
+
+All outputs must enforce temporal safety: no information beyond dataset val_start.
+
+==================================================
+1) INPUTS AND RUNTIME ASSUMPTIONS
+==================================================
+Input:
+- RelBench dataset (start with rel-f1, extensible to other RelBench datasets)
+- DuckDB + table metadata
+
+Environment:
+- Python env: ~/envs/llm
+- Stack: PyTorch / PyG / RelBench
+- Resources: 128 GB RAM, 8 CPU cores
+- Sampling: allowed for expensive profiling
+
+Global policy:
+- One global cutoff per dataset: val_start
+- Phase 1 visibility rule: only rows with time < val_start
+
+==================================================
+2) OUTPUT ARTIFACT CONTRACTS
+==================================================
+All artifacts include:
+- artifact_version
+- dataset_name
+- generation_timestamp_utc
+- global_cutoff_time
+- sampled flags where applicable
+
+2.1 schema.json
+- tables
+- columns (name, dtype, nullable)
+- provided PK/FK metadata
+- inferred PK/FK candidates with confidence
+- time columns per table
+- table role hints (entity/event/static/lookup/bridge)
+
+2.2 stats.json
+- per-table row counts (cutoff-applied)
+- per-column missingness
+- numeric stats: min/max/mean/std/median/mode/quantiles
+- categorical stats: cardinality, top-k frequencies
+- distribution summaries (hist bins or sketches)
+- temporal coverage (min/max timestamp, density by bucket)
+- join fanout/explosion estimates
+- correlation summaries (with method + sample_size)
+
+2.3 semantics.json
+- table semantic labels
+- column semantic labels
+- leakage risk tags
+- explanatory notes and confidence
+
+2.4 path_catalog.json
+- enumerated paths up to depth 6-8
+- allowed join type (inner/left)
+- path semantic description
+- temporal-valid flag
+- cost features (fanout, growth estimates)
+- recommended flag (low-confidence FKs excluded by default)
+
+2.5 safety_rules.json
+- global cutoff rule
+- leakage checks and blocked patterns
+- prohibited visibility rules
+- artifact validation checklist
+
+==================================================
+3) IMPLEMENTATION WORKSTREAMS
+==================================================
+WS-A: Loader and Temporal Guard
+1. Resolve dataset and load DB objects.
+2. Derive val_start cutoff.
+3. Build cutoff-aware table views:
+   - if table has time col: keep rows with time < val_start
+   - if table has no time col: treat as static and keep all rows
+4. Persist cutoff metadata.
+
+WS-B: Structural Profiling
+1. Extract table list, columns, dtypes.
+2. Capture provided PK/FK from dataset metadata.
+3. Infer PK candidates:
+   - exact uniqueness and near-uniqueness
+   - composite key search (bounded combinations)
+4. Infer FK candidates:
+   - type compatibility
+   - overlap ratios
+   - null behavior
+   - temporal plausibility
+5. Assign confidence levels: high/medium/low.
+
+WS-C: Statistical Profiling
+1. Per-table size metrics.
+2. Per-column missingness.
+3. Numeric distributions:
+   - min/max, mean/std, median, mode, p10/p25/p50/p75/p90
+   - histograms or sketches
+4. Categorical summaries:
+   - cardinality, top-k values, frequency mass
+5. Temporal coverage:
+   - min/max timestamps, rows per bucket
+6. Join fanout and explosion estimates:
+   - p50/p95 fanout, estimated multiplier
+7. Sampling policy:
+   - activate when table/pair exceeds threshold
+   - set sampled=true and record sample_size
+
+WS-D: Correlation Profiling
+1. Numeric-numeric: Spearman.
+2. Categorical-categorical: Cramer's V.
+3. Numeric-categorical: effect-size/MI-like score.
+4. Cap policy:
+   - per-table top-k pairs
+   - global max pair budget
+5. Always attach support/sample stats.
+
+WS-E: Path Catalog Construction
+1. Build graph from PK/FK (provided + inferred).
+2. Enumerate join paths up to depth 6-8.
+3. For each path:
+   - join sequence
+   - join type support (inner/left)
+   - temporal validity markers
+   - cost estimates (fanout, growth)
+4. Mark path recommendation:
+   - recommended=true only when all links are high/medium confidence
+   - low-confidence links remain in full catalog but excluded by default
+
+WS-F: LLM Semantic Annotation
+1. Model: Llama 8B (initial).
+2. Deterministic settings:
+   - temperature=0
+   - top_p=1
+   - fixed seed if supported
+3. Strict JSON schema outputs.
+4. Retry policy:
+   - parse/validation retry up to 2 times
+5. Label:
+   - table role
+   - column role
+   - leakage risk hints
+   - path semantic interpretation
+
+WS-G: Safety Rule Synthesis
+1. Encode no-leak policy with val_start cutoff.
+2. Identify suspicious columns/patterns (leakage-prone).
+3. Define blocked usage rules for Phase 2.
+4. Save explicit machine-readable rules in safety_rules.json.
+
+WS-H: Validation and Packaging
+1. Validate all JSON files against schema.
+2. Verify required fields and references.
+3. Run consistency checks:
+   - FK endpoints exist
+   - path endpoints valid
+   - stats correspond to cutoff-filtered row counts
+4. Emit final artifact bundle.
+
+==================================================
+4) DATA QUALITY + FAILURE MODES
+==================================================
+DQ checks:
+- unknown or mixed dtypes
+- high null FK columns
+- many-to-many bridge detection
+- disconnected tables
+- timestamp parse failures
+
+Failure handling:
+- non-fatal issues recorded as warnings in artifacts
+- critical issues fail Phase 1 with actionable message
+- sampled fallbacks used when full profiling is too expensive
+
+==================================================
+5) CONFIGURATION SURFACE (PHASE 1)
+==================================================
+Recommended config keys:
+- dataset_name
+- max_path_depth (default 8)
+- cutoff_mode (global_val_start)
+- sampling_enabled (true)
+- sampling_row_threshold
+- correlation_topk_per_table
+- correlation_global_cap
+- llm_model_name
+- llm_temperature (0)
+- llm_top_p (1)
+- llm_max_retries (2)
+- output_dir
+
+==================================================
+6) ACCEPTANCE CRITERIA
+==================================================
+Phase 1 is complete when:
+1. All 5 artifacts are generated.
+2. All artifacts pass schema validation.
+3. Global cutoff rule is recorded and enforced.
+4. Path catalog includes full + recommended views.
+5. Sample flags appear where approximations were used.
+6. Re-running with same config yields stable outputs (within tolerance for sampled stats).
+
+==================================================
+7) IMPLEMENTATION ORDER (EXECUTION PLAN)
+==================================================
+Milestone 1:
+- WS-A + WS-B + schema.json
+
+Milestone 2:
+- WS-C + WS-D + stats.json
+
+Milestone 3:
+- WS-E + path_catalog.json
+
+Milestone 4:
+- WS-F + semantics.json
+
+Milestone 5:
+- WS-G + safety_rules.json
+
+Milestone 6:
+- WS-H validation, packaging, and final report
+
+==================================================
+8) NOTES FOR PHASE 2 HANDOFF
+==================================================
+- Phase 2 should consume recommended paths by default.
+- It may optionally inspect full path catalog for exploration.
+- All retrieval and feature generation in later phases must honor safety_rules.json.

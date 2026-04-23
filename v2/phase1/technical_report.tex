@@ -1,0 +1,74 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{hyperref}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\title{Phase 1 Technical Report: Dataset-Aware Relational Intelligence Extraction}
+\author{RFM v2 Phase 1}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\section{Purpose}
+Phase 1 builds reusable, dataset-aware artifacts for downstream task compilers. It is task-agnostic and enforces a global temporal cutoff derived from dataset validation starts.
+
+\section{Pipeline Outputs}
+For dataset $D$, artifacts are emitted under \texttt{<output-dir>/<D>/}:
+\begin{itemize}[leftmargin=1.5em]
+  \item \texttt{schema.json}
+  \item \texttt{stats.json}
+  \item \texttt{semantics.json}
+  \item \texttt{semantic\_context\_graph.json}
+  \item \texttt{path\_catalog.json}
+  \item \texttt{safety\_rules.json}
+\end{itemize}
+
+\section{Refactored Module Layout}
+The codebase is split for readability and extension:
+\begin{itemize}[leftmargin=1.5em]
+  \item \texttt{phase1\_pipeline.py}: orchestration and artifact assembly.
+  \item \texttt{phase1\_utils.py}: JSON serialization, statistical primitives, role enums.
+  \item \texttt{phase1\_fk.py}: FK candidate inference utilities.
+  \item \texttt{phase1\_semantic\_graph.py}: semantic context graph construction.
+\end{itemize}
+
+\section{Temporal Policy}
+A single global cutoff (minimum \texttt{val\_start} across tasks in the dataset) is used. All Phase 1 profiling and relation inference uses rows strictly earlier than this cutoff.
+
+\section{FK Inference Summary}
+Inferred FK candidates use overlap and naming compatibility constraints:
+\begin{itemize}[leftmargin=1.5em]
+  \item child column must be ID-like and non-generic;
+  \item overlap ratio thresholding (high/medium confidence);
+  \item lexical compatibility between child-ID stem and parent identifiers;
+  \item uniqueness guardrails to avoid pseudo-links.
+\end{itemize}
+
+\section{Semantic Context Graph}
+The graph contains table nodes and directed edges:
+\begin{itemize}[leftmargin=1.5em]
+  \item Node fields include role, row count, trusted measure columns, degree/hub stats.
+  \item Edge fields include direction, source (provided/inferred), overlap ratio,
+  cardinality risk, temporal alignment, and composite edge weight.
+\end{itemize}
+
+\section{LLM Usage}
+Optional LLM annotation is used for semantic roles and optional path scoring. Heuristic fallback remains available for robustness.
+
+\section{Extensibility Points}
+\begin{itemize}[leftmargin=1.5em]
+  \item Replace FK confidence thresholds in \texttt{phase1\_fk.py}.
+  \item Add new role-affinity or edge-weight terms in \texttt{phase1\_semantic\_graph.py}.
+  \item Add new per-column statistics in \texttt{phase1\_utils.py} and wire into \texttt{stats.json}.
+\end{itemize}
+
+\section{Reproducibility}
+Default execution:
+\begin{verbatim}
+python phase1/phase1_pipeline.py \
+  --dataset rel-f1 \
+  --output-dir phase1/artifacts
+\end{verbatim}
+
+\end{document}

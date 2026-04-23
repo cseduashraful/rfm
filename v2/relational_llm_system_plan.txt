@@ -1,0 +1,197 @@
+CONCRETE SYSTEM PLAN: RELATIONAL DB → LLM-DRIVEN RETRIEVAL → PREDICTION
+
+--------------------------------------------------
+OVERVIEW
+--------------------------------------------------
+Goal:
+Build a system that converts a relational database + task description into a reusable, executable retrieval policy for prediction.
+
+Pipeline:
+1. Database Intelligence Extraction (offline, large LLM + profiling)
+2. Task Compilation (solver + critic, large LLM)
+3. Runtime Inference (fast retrieval + small LLM prediction)
+
+--------------------------------------------------
+PHASE 1: DATABASE INTELLIGENCE EXTRACTION
+--------------------------------------------------
+
+Input:
+- DuckDB database (initially relbench f1 dataset and converted to duckdb)
+
+Steps:
+
+1. Structural Profiling (programmatic)
+   - Extract tables, columns, types
+   - Detect primary keys and foreign keys
+   - Infer join relationships
+   - Identify entity tables vs event tables
+   - Identify timestamp columns
+   - Compute cardinality (row count, distinct counts)
+
+2. Statistical Profiling (programmatic)
+   - Missingness per column
+   - Value distributions
+   - Temporal coverage
+   - Basic correlations (safe subsets)
+   - Join cardinality explosion estimates
+
+3. Semantic Annotation (large LLM)
+   - Label tables: entity / event / lookup / bridge
+   - Label columns: id / timestamp / measure / status / category
+   - Identify candidate target-like columns
+   - Detect possible leakage columns
+   - Infer semantic relationships
+
+4. Path Catalog Construction (programmatic)
+   - Enumerate valid join paths up to depth D (e.g., 3)
+   - For each path:
+       - store join sequence
+       - estimate cardinality growth
+       - check temporal validity
+
+5. Path Interpretation (large LLM)
+   - Add semantic meaning to each path
+   - Suggest when path is useful
+   - Suggest aggregation types
+
+Outputs (Database Intelligence Bundle):
+- schema.json
+- stats.json
+- semantics.json
+- path_catalog.json
+- safety_rules.json
+
+--------------------------------------------------
+PHASE 2: TASK COMPILATION
+--------------------------------------------------
+
+Input:
+- Task description
+- Database Intelligence Bundle
+
+Steps:
+
+1. Task Grounding
+   - Identify source entity
+   - Identify prediction target
+   - Identify time cutoff rules
+   - Determine task type (regression/classification)
+
+2. Path Scoring (LLM)
+   - Score each path using:
+       - semantic relevance
+       - proximity to entity
+       - temporal validity
+       - cardinality cost
+       - leakage risk
+
+3. Feature Policy Generation
+   - Define allowed transformations:
+       - count, mean, min, max, std
+       - recency-based features
+       - trend features
+   - Map preferred transforms to path types
+
+4. Depth Policy
+   - Default max depth = 2
+   - Allow deeper paths only if:
+       - path score high
+       - branching factor manageable
+
+5. Budget Allocation
+   - Allocate context budget:
+       - self history
+       - one-hop paths
+       - multi-hop paths
+       - neighbors
+
+6. Safety Constraints
+   - No future rows
+   - No leakage columns
+   - Exclude unsafe joins
+
+--------------------------------------------------
+SOLVER–CRITIC LOOP
+--------------------------------------------------
+
+Round 1:
+- Solver generates initial task_spec
+
+Round 2:
+- Critic checks:
+    - leakage paths
+    - high-cardinality joins
+    - weak semantic links
+    - sparse self-history cases
+
+Round 3:
+- Solver revises task_spec
+
+Stop:
+- max 3 rounds OR no major issues
+
+--------------------------------------------------
+OUTPUT OF PHASE 2
+--------------------------------------------------
+
+task_spec.json including:
+- task definition
+- path scoring rules
+- feature construction rules
+- depth policy
+- budget policy
+- safety constraints
+
+--------------------------------------------------
+PHASE 3: RUNTIME INFERENCE
+--------------------------------------------------
+
+Steps:
+
+1. Check artifacts
+   - If DB bundle missing → run Phase 1
+   - If task_spec missing → run Phase 2
+
+2. Retrieval
+   - Use path scoring to select top-k paths
+   - Use fast-DFS to compute features
+
+3. Feature Construction
+   - Apply selected aggregations
+   - Build compact evidence set
+
+4. Context Construction
+   - Include:
+       - self history summaries
+       - top relational features
+       - selected neighbor evidence
+
+5. Prediction
+   - Use small LLM
+   - Input: curated context
+   - Output: numeric prediction
+
+--------------------------------------------------
+KEY DESIGN PRINCIPLES
+--------------------------------------------------
+
+- Separate path scoring from feature scoring
+- Use programmatic enumeration, LLM for ranking
+- Enforce temporal safety strictly
+- Keep runtime lightweight
+- Cache all expensive computations
+- Use structured outputs (JSON/YAML), not prose
+
+--------------------------------------------------
+SUMMARY
+--------------------------------------------------
+
+System acts like a compiler:
+
+Database → Intelligence Bundle → Task Spec → Retrieval Plan → Prediction
+
+This ensures:
+- scalability
+- reusability
+- interpretability
+- efficiency
