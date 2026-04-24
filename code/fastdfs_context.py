@@ -413,6 +413,7 @@ def build_fastdfs_context_builder(
     max_depth: int = 2,
     max_metapath_groups: int = 5,
     max_features_per_metapath: int = 100,
+    engine_path: str | None = None,
 ):
     try:
         import fastdfs
@@ -469,6 +470,8 @@ def build_fastdfs_context_builder(
     training_window = None
     active_window_key: str | None = None
     base_kwargs = {"max_depth": max_depth, "use_cutoff_time": True}
+    if engine_path:
+        base_kwargs["engine_path"] = engine_path
     dfs_config = DFSConfig(**base_kwargs)
 
     key_mappings = {resource.entity_col: f"{resource.entity_table}.{entity_table_pk}"}

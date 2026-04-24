@@ -26,3 +26,32 @@ python RFM/v2/phase3/phase3_pipeline.py \
   --model-size 3b \
   --llm-batch-size 1 \
   --history-length 10
+
+
+
+python RFM/v2/phase3/phase3_pipeline.py \
+  --dataset rel-trial \
+  --task study-adverse \
+  --phase2-artifacts-dir RFM/v2/phase2/artifacts \
+  --output-dir RFM/v2/phase3/artifacts \
+  --model-size 8b \
+  --preprocess-batch-size 16 \
+  --dfs-batch-size 8 \
+  --llm-batch-size 2 \
+  --other-example-search-mode dfs_similarity \
+  --dfs-similarity-cutoff-cache-size 8 \
+  --print-predictions
+
+
+python RFM/v2/phase3/phase3_pipeline.py \
+  --dataset rel-f1 \
+  --task driver-position \
+  --phase2-artifacts-dir RFM/v2/phase2/artifacts \
+  --output-dir RFM/v2/phase3/artifacts \
+  --model-size 8b \
+  --preprocess-batch-size 16 \
+  --dfs-batch-size 8 \
+  --llm-batch-size 2 \
+  --other-example-search-mode dfs_similarity \
+  --dfs-similarity-cutoff-cache-size 8 \
+  --print-predictions

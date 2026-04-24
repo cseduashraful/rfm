@@ -3,8 +3,10 @@ from __future__ import annotations
 import argparse
 import pdb
 import json
+import os
 import re
 import sys
+import tempfile
 import time
 import warnings
 from dataclasses import dataclass
@@ -22,7 +24,7 @@ if str(_RFM_CODE_DIR) not in sys.path:
 
 from fastdfs_context import build_fastdfs_context_builder  # type: ignore
 from grag import RelBenchGraphRAGStore, RowFeatureExtractor, build_zero_shot_prompt  # type: ignore
-from inference_history import build_inference_resource  # type: ignore
+from inference_history import build_inference_resource, build_raw_dataset_timestamps  # type: ignore
 from relbench.tasks import get_task  # type: ignore
 from task_history_queries import TASK_HISTORY_FEATURE_HINTS_REGISTRY  # type: ignore
 from zero_shot_llm import LocalLLM, MODEL_PATHS, extract_number  # type: ignore
@@ -243,23 +245,29 @@ def _build_single_task_inference_config(
     }
 
 
-def _build_example_pool(task_obj: Any, *, entity_col: str, time_col: str, output_col: str) -> pd.DataFrame:
-    frames = []
+def _build_example_pool(
+    resource: Any,
+    *,
+    entity_col: str,
+    time_col: str,
+    output_col: str,
+    max_query_time: pd.Timestamp,
+) -> pd.DataFrame:
     required = {entity_col, time_col, output_col}
-    for split in ("train", "val", "test"):
-        try:
-            table = task_obj.get_table(split, mask_input_cols=False)
-        except Exception:
-            continue
-        df = table.df.copy()
-        if not required.issubset(set(df.columns)):
-            continue
-        frames.append(df)
-
-    if not frames:
+    timestamps = build_raw_dataset_timestamps(resource.db)
+    if timestamps.empty:
         return pd.DataFrame(columns=[entity_col, time_col, output_col])
 
-    pooled = pd.concat(frames, ignore_index=True)
+    timestamps = timestamps[pd.to_datetime(timestamps, errors="coerce") < max_query_time]
+    if timestamps.empty:
+        return pd.DataFrame(columns=[entity_col, time_col, output_col])
+
+    history_table = resource.task_object.make_table(resource.db, pd.Series(timestamps))
+    pooled = history_table.df.copy()
+    if not required.issubset(set(pooled.columns)):
+        return pd.DataFrame(columns=[entity_col, time_col, output_col])
+
+    pooled = pooled[[entity_col, time_col, output_col]]
     pooled[time_col] = pd.to_datetime(pooled[time_col], errors="coerce")
     pooled = pooled.dropna(subset=[time_col]).reset_index(drop=True)
     pooled = pooled.sort_values(by=[time_col], kind="stable").reset_index(drop=True)
@@ -575,6 +583,29 @@ def _numeric_feature_map(feature_dict: dict[str, Any]) -> dict[str, float]:
     return out
 
 
+def _query_feature_cache_key(entity_value: Any, cutoff_time: Any) -> tuple[str, int]:
+    return (_entity_key(entity_value), int(pd.Timestamp(cutoff_time).value))
+
+
+def _build_query_feature_cache_for_rows(
+    *,
+    rows: list[dict[str, Any]],
+    resource: Any,
+    dfs_builder: Any,
+) -> dict[tuple[str, int], dict[str, float]]:
+    if not rows:
+        return {}
+    feature_dicts = dfs_builder.feature_dicts_for_rows([dict(r) for r in rows])
+    cache: dict[tuple[str, int], dict[str, float]] = {}
+    for row, fdict in zip(rows, feature_dicts):
+        cache_key = _query_feature_cache_key(
+            row.get(resource.entity_col),
+            row.get(resource.time_col),
+        )
+        cache[cache_key] = _numeric_feature_map(fdict)
+    return cache
+
+
 def _dfs_feature_similarity(
     query_features: dict[str, float],
     candidate_features: dict[str, float],
@@ -611,6 +642,9 @@ def _select_other_entity_examples_by_dfs_similarity(
     neighbor_entity_count: int,
     neighbor_history_count: int,
     dfs_builder: Any,
+    cutoff_cache: dict[int, dict[str, Any]] | None = None,
+    cutoff_cache_size: int = 8,
+    query_features_override: dict[str, float] | None = None,
 ) -> list[dict[str, Any]]:
     if (
         max_rows <= 0
@@ -621,41 +655,63 @@ def _select_other_entity_examples_by_dfs_similarity(
         return []
 
     query_entity_key = _entity_key(entity_value)
-    pool = example_pool_df[example_pool_df[resource.time_col] < cutoff_time].copy()
-    if pool.empty:
-        return []
-    pool["__entity_key"] = pool[resource.entity_col].map(_entity_key)
-    pool = pool[pool["__entity_key"] != query_entity_key]
-    if pool.empty:
-        return []
+    cutoff_ns = int(pd.Timestamp(cutoff_time).value)
+    cache_entry: dict[str, Any] | None = None
+    if cutoff_cache is not None:
+        cache_entry = cutoff_cache.get(cutoff_ns)
 
-    # Representative candidate row: latest pre-cutoff row per entity.
-    reps = (
-        pool.sort_values(by=[resource.time_col], ascending=False, kind="stable")
-        .drop_duplicates(subset=["__entity_key"], keep="first")
-        .reset_index(drop=True)
-    )
-    if reps.empty:
-        return []
+    if cache_entry is None:
+        pool_all = example_pool_df[example_pool_df[resource.time_col] < cutoff_time].copy()
+        if pool_all.empty:
+            return []
+        pool_all["__entity_key"] = pool_all[resource.entity_col].map(_entity_key)
+        if pool_all.empty:
+            return []
 
-    rep_rows = reps.to_dict(orient="records")
-    feature_rows = [dict(query_row)] + [dict(r) for r in rep_rows]
-    feature_dicts = dfs_builder.feature_dicts_for_rows(feature_rows)
-    if not feature_dicts:
-        return []
+        # Representative candidate row: latest pre-cutoff row per entity.
+        reps = (
+            pool_all.sort_values(by=[resource.time_col], ascending=False, kind="stable")
+            .drop_duplicates(subset=["__entity_key"], keep="first")
+            .reset_index(drop=True)
+        )
+        if reps.empty:
+            return []
+        rep_rows = reps.to_dict(orient="records")
+        rep_feature_dicts = dfs_builder.feature_dicts_for_rows([dict(r) for r in rep_rows])
+        rep_numeric_features = [_numeric_feature_map(fdict) for fdict in rep_feature_dicts]
+        cache_entry = {
+            "pool_all": pool_all,
+            "rep_rows": rep_rows,
+            "rep_numeric_features": rep_numeric_features,
+        }
+        if cutoff_cache is not None and cutoff_cache_size > 0:
+            cutoff_cache[cutoff_ns] = cache_entry
+            while len(cutoff_cache) > int(cutoff_cache_size):
+                oldest_key = next(iter(cutoff_cache))
+                cutoff_cache.pop(oldest_key, None)
 
-    query_features = _numeric_feature_map(feature_dicts[0] if len(feature_dicts) > 0 else {})
+    pool_all = cache_entry["pool_all"]
+    rep_rows = cache_entry["rep_rows"]
+    rep_numeric_features = cache_entry["rep_numeric_features"]
+
+    query_features = query_features_override
+    if query_features is None:
+        query_feature_dicts = dfs_builder.feature_dicts_for_rows([dict(query_row)])
+        if not query_feature_dicts:
+            return []
+        query_features = _numeric_feature_map(query_feature_dicts[0])
     if not query_features:
         return []
 
     ranked: list[tuple[float, int, pd.Timestamp, str]] = []
-    for rep_row, fdict in zip(rep_rows, feature_dicts[1:]):
-        cand_features = _numeric_feature_map(fdict)
+    for rep_row, cand_features in zip(rep_rows, rep_numeric_features):
+        ek = str(rep_row.get("__entity_key", ""))
+        if not ek or ek == query_entity_key:
+            continue
         score, shared_count = _dfs_feature_similarity(query_features, cand_features)
         if score < 0:
             continue
         ts = pd.Timestamp(rep_row[resource.time_col])
-        ek = str(rep_row["__entity_key"])
         ranked.append((score, shared_count, ts, ek))
 
     if not ranked:
@@ -668,7 +724,7 @@ def _select_other_entity_examples_by_dfs_similarity(
 
     records: list[dict[str, Any]] = []
     for ek in selected_entity_keys:
-        entity_rows = pool[pool["__entity_key"] == ek]
+        entity_rows = pool_all[pool_all["__entity_key"] == ek]
         if entity_rows.empty:
             continue
         recent_rows = (
@@ -737,7 +793,25 @@ def _is_debug_breakpoint_prediction(
     return abs(pred - target) >= float(large_gap_threshold)
 
 
+def _configure_tmp_dirs(default_tmp_dir: Path) -> None:
+    tmp_path = default_tmp_dir.expanduser()
+    try:
+        tmp_path.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        return
+    if not os.access(tmp_path, os.W_OK):
+        return
+
+    # Set only when caller hasn't explicitly configured temp dirs.
+    for env_name in ("TMPDIR", "TMP", "TEMP", "DUCKDB_TMPDIR"):
+        if not os.environ.get(env_name):
+            os.environ[env_name] = str(tmp_path)
+    # Force Python tempfile module to honor this directory in-process.
+    tempfile.tempdir = str(tmp_path)
+
+
 def run(args: argparse.Namespace) -> None:
+    _configure_tmp_dirs(args.tmp_dir)
     # Reduce noisy non-fatal warnings from featuretools/woodwork during repeated DFS calls.
     warnings.filterwarnings(
         "ignore",
@@ -775,7 +849,11 @@ def run(args: argparse.Namespace) -> None:
     graph_store.build_base(resource.db, task=resource.task_object)
     extractor = RowFeatureExtractor(resource.db, graph_store)
 
-    base_dfs_builder = build_fastdfs_context_builder(resource)
+    fastdfs_engine_path = args.tmp_dir / f"fastdfs_{args.dataset}_{args.task}_{os.getpid()}.db"
+    base_dfs_builder = build_fastdfs_context_builder(
+        resource,
+        engine_path=str(fastdfs_engine_path),
+    )
     dfs_builder = Phase2AwareFastDFSBuilder(base_dfs_builder, policy)
 
     task_obj = get_task(args.dataset, args.task, download=True)
@@ -784,15 +862,21 @@ def run(args: argparse.Namespace) -> None:
     if args.max_items > 0:
         test_rows = test_rows[: args.max_items]
 
+    max_query_time = max(
+        (pd.Timestamp(row._asdict()[resource.time_col]) for row in test_rows),
+        default=pd.Timestamp.min,
+    )
     pool_df = _build_example_pool(
-        task_obj,
+        resource,
         entity_col=resource.entity_col,
         time_col=resource.time_col,
         output_col=resource.output_col,
+        max_query_time=max_query_time,
     )
     static_similarity_index = (
         _build_static_similarity_index(resource) if args.use_static_similar_others else None
     )
+    dfs_similarity_cutoff_cache: dict[int, dict[str, Any]] = {}
 
     llm = LocalLLM(MODEL_PATHS[args.model_size], print_log=True)
     inference_start_time = time.perf_counter()
@@ -808,6 +892,14 @@ def run(args: argparse.Namespace) -> None:
         pre_end = min(total_items, pre_start + preprocess_batch_size)
         pre_rows = test_rows[pre_start:pre_end]
         eval_items: list[EvalItem] = []
+        dfs_similarity_query_cache: dict[tuple[str, int], dict[str, float]] = {}
+        if args.other_example_search_mode == "dfs_similarity":
+            pre_rows_dicts = [row._asdict() for row in pre_rows]
+            dfs_similarity_query_cache = _build_query_feature_cache_for_rows(
+                rows=pre_rows_dicts,
+                resource=resource,
+                dfs_builder=dfs_builder,
+            )
 
         for offset, row in enumerate(pre_rows):
             row_index = pre_start + offset
@@ -833,6 +925,14 @@ def run(args: argparse.Namespace) -> None:
                     neighbor_entity_count=max(0, args.other_neighbor_entity_count),
                     neighbor_history_count=max(0, args.other_neighbor_history_count),
                     dfs_builder=dfs_builder,
+                    cutoff_cache=dfs_similarity_cutoff_cache,
+                    cutoff_cache_size=max(0, int(args.dfs_similarity_cutoff_cache_size)),
+                    query_features_override=dfs_similarity_query_cache.get(
+                        _query_feature_cache_key(
+                            row_dict.get(resource.entity_col),
+                            q_time,
+                        )
+                    ),
                 )
             else:
                 other_history_rows = _select_other_entity_examples(
@@ -1020,6 +1120,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--task", type=str, required=True)
     parser.add_argument("--phase2-artifacts-dir", type=Path, default=Path("RFM/v2/phase2/artifacts"))
     parser.add_argument("--output-dir", type=Path, default=Path("RFM/v2/phase3/artifacts"))
+    parser.add_argument(
+        "--tmp-dir",
+        type=Path,
+        default=Path("/work/pi_mserafini_umass_edu/ashraful/tmp"),
+        help="Default temp directory for fastdfs/duckdb scratch files.",
+    )
     parser.add_argument("--model-size", type=str, default="8b", choices=sorted(MODEL_PATHS.keys()))
     parser.add_argument("--llm-batch-size", type=int, default=2)
     parser.add_argument("--max-new-tokens", type=int, default=24)
@@ -1033,6 +1139,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--other-neighbor-entity-count", type=int, default=3)
     parser.add_argument("--other-neighbor-history-count", type=int, default=3)
     parser.add_argument("--other-neighbor-search-hops", type=int, default=2)
+    parser.add_argument(
+        "--dfs-similarity-cutoff-cache-size",
+        type=int,
+        default=8,
+        help=(
+            "Number of cutoff timestamps to cache for dfs_similarity candidate "
+            "features. Set 0 to disable cache."
+        ),
+    )
     parser.add_argument(
         "--other-example-search-mode",
         type=str,

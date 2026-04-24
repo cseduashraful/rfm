@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import itertools
 import json
 import math
+import os
 import re
 import sys
+import time
 from collections import Counter
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
@@ -92,6 +95,8 @@ class Phase1Config:
     use_llm_path_scoring: bool = False
     llm_path_top_k: int = 200
     compute_path_catalog: bool = False
+    stats_workers: int = 1
+    stats_checkpoint_resume: bool = True
 
 
 class Phase1Pipeline:
@@ -195,12 +200,12 @@ class Phase1Pipeline:
     ) -> dict[str, pd.DataFrame]:
         filtered: dict[str, pd.DataFrame] = {}
         for table_name, table in db.table_dict.items():
-            frame = table.df.copy()
+            frame = table.df
             time_col = table.time_col
             if time_col is not None and time_col in frame.columns:
                 ts = pd.to_datetime(frame[time_col], errors="coerce")
                 mask = ts.notna() & (ts < cutoff)
-                frame = frame.loc[mask].copy()
+                frame = frame.loc[mask]
             filtered[table_name] = frame
         return filtered
 
@@ -332,33 +337,47 @@ class Phase1Pipeline:
             "coverage_by_month": {k: int(v) for k, v in monthly.items()},
         }
 
-    def _build_correlations_for_table(self, frame: pd.DataFrame, table_name: str) -> list[dict[str, Any]]:
+    def _build_correlations_for_table(
+        self,
+        sampled_df: pd.DataFrame,
+        table_name: str,
+        *,
+        sampled: bool,
+    ) -> list[dict[str, Any]]:
         if self.config.skip_correlations:
             return []
-        sampled_df, sampled = self._sample_if_needed(frame)
         correlations: list[dict[str, Any]] = []
 
         numeric_cols = [c for c in sampled_df.columns if _is_numeric(sampled_df[c])]
         cat_cols = [c for c in sampled_df.columns if not _is_numeric(sampled_df[c])]
 
-        for a, b in itertools.combinations(numeric_cols[:40], 2):
-            pair = sampled_df[[a, b]].dropna()
-            if len(pair) < 30:
-                continue
-            val = pair[a].corr(pair[b], method="spearman")
-            if pd.isna(val):
-                continue
-            correlations.append(
-                {
-                    "type": "numeric_numeric_spearman",
-                    "table": table_name,
-                    "col_a": a,
-                    "col_b": b,
-                    "score": float(val),
-                    "sampled": sampled,
-                    "sample_size": int(len(pair)),
-                }
-            )
+        # Vectorized Spearman for numeric pairs to avoid many pairwise dropna scans.
+        num_subset = numeric_cols[:40]
+        if len(num_subset) >= 2:
+            num_df = sampled_df[num_subset].apply(pd.to_numeric, errors="coerce")
+            corr_mat = num_df.corr(method="spearman", min_periods=30)
+            notna = num_df.notna().astype(np.int8)
+            valid_counts = notna.T.dot(notna)
+            for i, a in enumerate(num_subset):
+                for j in range(i + 1, len(num_subset)):
+                    b = num_subset[j]
+                    val = corr_mat.loc[a, b]
+                    if pd.isna(val):
+                        continue
+                    sample_size = int(valid_counts.loc[a, b])
+                    if sample_size < 30:
+                        continue
+                    correlations.append(
+                        {
+                            "type": "numeric_numeric_spearman",
+                            "table": table_name,
+                            "col_a": a,
+                            "col_b": b,
+                            "score": float(val),
+                            "sampled": sampled,
+                            "sample_size": sample_size,
+                        }
+                    )
 
         for a, b in itertools.combinations(cat_cols[:25], 2):
             pair = sampled_df[[a, b]].dropna()
@@ -406,43 +425,174 @@ class Phase1Pipeline:
         correlations.sort(key=lambda x: abs(float(x["score"])), reverse=True)
         return correlations[: self.config.correlation_topk_per_table]
 
+    def _build_stats_for_single_table(
+        self,
+        table_name: str,
+        table: Any,
+        frame: pd.DataFrame,
+    ) -> tuple[dict[str, Any], float]:
+        t0 = time.perf_counter()
+        sampled_frame, sampled = self._sample_if_needed(frame)
+        col_stats: dict[str, Any] = {}
+
+        if len(frame):
+            missingness_by_col = frame.isna().mean()
+            non_null_by_col = frame.notna().sum()
+        else:
+            missingness_by_col = pd.Series(index=frame.columns, dtype=float)
+            non_null_by_col = pd.Series(index=frame.columns, dtype=float)
+
+        for col in frame.columns:
+            full_col = frame[col]
+            prof_col = sampled_frame[col] if col in sampled_frame.columns else full_col
+            base = {
+                "missingness": float(missingness_by_col.get(col, 0.0)) if len(full_col) else None,
+                "non_null_count": int(non_null_by_col.get(col, 0)),
+                "sampled": sampled,
+                "profile_sample_size": int(len(prof_col)),
+            }
+            if _is_numeric(full_col):
+                base["numeric"] = self._numeric_stats(prof_col)
+            else:
+                base["categorical"] = self._categorical_stats(prof_col)
+            col_stats[col] = base
+
+        table_corrs = self._build_correlations_for_table(
+            sampled_df=sampled_frame,
+            table_name=table_name,
+            sampled=sampled,
+        )
+        table_payload = {
+            "table_name": table_name,
+            "row_count": int(len(frame)),
+            "sampled": sampled,
+            "temporal_coverage": self._table_temporal_coverage(frame, table.time_col),
+            "columns": col_stats,
+            "correlations": table_corrs,
+        }
+        elapsed = time.perf_counter() - t0
+        return table_payload, elapsed
+
     def _build_stats_artifact(self, db: Any, filtered: dict[str, pd.DataFrame], cutoff: pd.Timestamp) -> dict[str, Any]:
         header = self._artifact_header(cutoff)
-        tables = []
+        table_order = list(db.table_dict.keys())
+        total_tables = len(table_order)
+        tables_by_name: dict[str, dict[str, Any]] = {}
         all_corrs: list[dict[str, Any]] = []
+        stats_dir = self.config.output_dir / self.config.dataset
+        stats_dir.mkdir(parents=True, exist_ok=True)
+        ckpt_tables_path = stats_dir / "stats_tables_checkpoint.ndjson"
+        ckpt_meta_path = stats_dir / "stats_checkpoint_meta.json"
+        ckpt_progress_path = stats_dir / "stats_progress.json"
+        ckpt_signature = {
+            "artifact_version": self.config.artifact_version,
+            "dataset_name": self.config.dataset,
+            "global_cutoff_time": str(cutoff),
+            "sampling_enabled": bool(self.config.sampling_enabled),
+            "sampling_row_threshold": int(self.config.sampling_row_threshold),
+            "sample_size": int(self.config.sample_size),
+            "correlation_topk_per_table": int(self.config.correlation_topk_per_table),
+            "skip_correlations": bool(self.config.skip_correlations),
+            "histogram_bins": int(self.config.histogram_bins),
+            "categorical_topk": int(self.config.categorical_topk),
+        }
 
-        for table_name, table in db.table_dict.items():
-            frame = filtered[table_name]
-            sampled_frame, sampled = self._sample_if_needed(frame)
-            col_stats: dict[str, Any] = {}
-            for col in frame.columns:
-                full_col = frame[col]
-                prof_col = sampled_frame[col] if col in sampled_frame.columns else full_col
-                base = {
-                    "missingness": float(full_col.isna().mean()) if len(full_col) else None,
-                    "non_null_count": int(full_col.notna().sum()),
-                    "sampled": sampled,
-                    "profile_sample_size": int(len(prof_col)),
-                }
-                if _is_numeric(full_col):
-                    base["numeric"] = self._numeric_stats(prof_col)
-                else:
-                    base["categorical"] = self._categorical_stats(prof_col)
-                col_stats[col] = base
+        resume_enabled = bool(self.config.stats_checkpoint_resume)
+        if resume_enabled and ckpt_meta_path.exists() and ckpt_tables_path.exists():
+            try:
+                existing_meta = json.loads(ckpt_meta_path.read_text(encoding="utf-8"))
+            except Exception:
+                existing_meta = {}
+            if existing_meta == ckpt_signature:
+                with ckpt_tables_path.open("r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            payload = json.loads(line)
+                        except Exception:
+                            continue
+                        tname = str(payload.get("table_name", ""))
+                        if tname and tname in db.table_dict:
+                            tables_by_name[tname] = payload
+                if tables_by_name:
+                    print(
+                        f"[phase1][stats] resumed {len(tables_by_name)}/{total_tables} tables from checkpoint."
+                    )
+            else:
+                ckpt_tables_path.unlink(missing_ok=True)
+                ckpt_progress_path.unlink(missing_ok=True)
+        else:
+            ckpt_tables_path.unlink(missing_ok=True)
+            ckpt_progress_path.unlink(missing_ok=True)
 
-            table_corrs = self._build_correlations_for_table(frame, table_name)
-            all_corrs.extend(table_corrs)
+        ckpt_meta_path.write_text(json.dumps(ckpt_signature, indent=2), encoding="utf-8")
 
-            tables.append(
-                {
-                    "table_name": table_name,
-                    "row_count": int(len(frame)),
-                    "sampled": sampled,
-                    "temporal_coverage": self._table_temporal_coverage(frame, table.time_col),
-                    "columns": col_stats,
-                    "correlations": table_corrs,
-                }
-            )
+        for resumed in tables_by_name.values():
+            all_corrs.extend(resumed.get("correlations", []))
+
+        pending_tables = [t for t in table_order if t not in tables_by_name]
+        max_workers = max(1, int(self.config.stats_workers))
+        print(
+            f"[phase1][stats] computing {len(pending_tables)} pending tables "
+            f"(workers={max_workers})."
+        )
+
+        def _record_checkpoint(table_payload: dict[str, Any], elapsed_sec: float) -> None:
+            with ckpt_tables_path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(table_payload, default=str))
+                f.write("\n")
+            completed = len(tables_by_name)
+            progress_payload = {
+                "dataset_name": self.config.dataset,
+                "global_cutoff_time": str(cutoff),
+                "completed_tables": completed,
+                "total_tables": total_tables,
+                "last_table_name": table_payload.get("table_name"),
+                "last_table_elapsed_sec": float(elapsed_sec),
+                "updated_at_utc": datetime.now(timezone.utc).isoformat(),
+            }
+            _write_json(ckpt_progress_path, progress_payload)
+
+        if pending_tables:
+            if max_workers == 1:
+                for idx, table_name in enumerate(pending_tables, start=1):
+                    table_payload, elapsed = self._build_stats_for_single_table(
+                        table_name=table_name,
+                        table=db.table_dict[table_name],
+                        frame=filtered[table_name],
+                    )
+                    tables_by_name[table_name] = table_payload
+                    all_corrs.extend(table_payload.get("correlations", []))
+                    _record_checkpoint(table_payload, elapsed)
+                    print(
+                        f"[phase1][stats] {len(tables_by_name)}/{total_tables} "
+                        f"table={table_name} done in {elapsed:.2f}s"
+                    )
+            else:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+                    future_map = {
+                        executor.submit(
+                            self._build_stats_for_single_table,
+                            table_name,
+                            db.table_dict[table_name],
+                            filtered[table_name],
+                        ): table_name
+                        for table_name in pending_tables
+                    }
+                    for future in concurrent.futures.as_completed(future_map):
+                        table_name = future_map[future]
+                        table_payload, elapsed = future.result()
+                        tables_by_name[table_name] = table_payload
+                        all_corrs.extend(table_payload.get("correlations", []))
+                        _record_checkpoint(table_payload, elapsed)
+                        print(
+                            f"[phase1][stats] {len(tables_by_name)}/{total_tables} "
+                            f"table={table_name} done in {elapsed:.2f}s"
+                        )
+
+        tables = [tables_by_name[t] for t in table_order if t in tables_by_name]
 
         all_corrs.sort(key=lambda x: abs(float(x["score"])), reverse=True)
         all_corrs = all_corrs[: self.config.correlation_global_cap]
@@ -1117,10 +1267,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--sample-size", type=int, default=100_000)
     parser.add_argument("--correlation-topk-per-table", type=int, default=30)
     parser.add_argument("--correlation-global-cap", type=int, default=500)
+    parser.add_argument("--stats-workers", type=int, default=1)
     parser.add_argument("--disable-sampling", action="store_true")
     parser.add_argument("--max-paths", type=int, default=50_000)
     parser.add_argument("--max-frontier-per-start", type=int, default=5_000)
     parser.add_argument("--skip-correlations", action="store_true")
+    parser.add_argument("--disable-stats-checkpoint-resume", action="store_true")
     parser.add_argument("--use-llm-semantics", action="store_true")
     parser.add_argument("--llm-model-size", choices=sorted(MODEL_PATHS), default="8b")
     parser.add_argument("--use-llm-path-scoring", action="store_true")
@@ -1152,6 +1304,12 @@ def main() -> None:
         compute_path_catalog=args.compute_path_catalog or args.use_llm_path_scoring,
         llm_semantics_confidence_threshold=args.llm_semantics_confidence_threshold,
         llm_semantics_use_ensemble=not args.disable_llm_semantics_ensemble,
+        stats_workers=(
+            max(1, int(args.stats_workers))
+            if int(args.stats_workers) > 0
+            else max(1, min(8, (os.cpu_count() or 1)))
+        ),
+        stats_checkpoint_resume=not args.disable_stats_checkpoint_resume,
     )
     pipeline = Phase1Pipeline(cfg)
     paths = pipeline.run()
