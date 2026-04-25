@@ -209,13 +209,29 @@ class Phase1Pipeline:
                 msg = f"task={task_name}: {exc}"
                 errors.append(msg)
                 task_reports.append({"task_name": task_name, "status": "error", "error": str(exc)})
-        if errors and self.config.strict_cutoff_task_loading:
+        unique_cutoffs = sorted({pd.Timestamp(ts) for _, ts in val_starts})
+        recoverable_errors = [
+            msg
+            for msg in errors
+            if self._is_retriable_task_load_error(msg)
+        ]
+        if (
+            errors
+            and self.config.strict_cutoff_task_loading
+            and not (unique_cutoffs and len(unique_cutoffs) == 1 and len(recoverable_errors) == len(errors))
+        ):
             raise RuntimeError(
                 "Failed to compute cutoff because one or more task validation tables could not be loaded: "
                 + "; ".join(errors[:10])
             )
         if not val_starts:
             raise RuntimeError(f"Could not determine global val_start cutoff for dataset={dataset}.")
+        if errors and unique_cutoffs and len(unique_cutoffs) == 1 and len(recoverable_errors) == len(errors):
+            warnings.append(
+                "One or more task artifacts could not be downloaded/verified, "
+                "but all successfully loaded tasks agreed on a single dataset cutoff. "
+                "Proceeding with that cutoff."
+            )
         selected_task, cutoff = min(val_starts, key=lambda item: item[1])
         return {
             "cutoff": cutoff,
@@ -223,6 +239,7 @@ class Phase1Pipeline:
             "task_reports": task_reports,
             "warnings": warnings,
             "errors": errors,
+            "unique_successful_cutoffs": [str(ts) for ts in unique_cutoffs],
         }
 
     def _load_task_for_cutoff(self, dataset: str, task_name: str) -> Any:
