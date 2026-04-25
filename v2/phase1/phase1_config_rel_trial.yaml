@@ -13,7 +13,7 @@ random_seed: 42
 artifact_version: phase1.v2
 stats_checkpoint_resume: true
 skip_correlations: false
-use_llm_semantics: false
+use_llm_semantics: true
 llm_model_size: 8b
 llm_semantics_confidence_threshold: 0.6
 llm_semantics_use_ensemble: true

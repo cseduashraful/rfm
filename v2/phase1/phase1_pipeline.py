@@ -56,7 +56,7 @@ class Phase1Config:
     max_paths: int = 50_000
     max_frontier_per_start: int = 5_000
     skip_correlations: bool = False
-    use_llm_semantics: bool = False
+    use_llm_semantics: bool = True
     llm_model_size: str = "8b"
     llm_semantics_confidence_threshold: float = 0.6
     llm_semantics_use_ensemble: bool = True
@@ -1302,11 +1302,18 @@ def build_arg_parser(defaults: dict[str, Any] | None = None) -> argparse.Argumen
         action="store_true",
         default=not bool(defaults.get("stats_checkpoint_resume", True)),
     )
-    parser.add_argument(
+    llm_semantics_group = parser.add_mutually_exclusive_group()
+    llm_semantics_group.add_argument(
         "--use-llm-semantics",
+        dest="use_llm_semantics",
         action="store_true",
-        default=bool(defaults.get("use_llm_semantics", False)),
     )
+    llm_semantics_group.add_argument(
+        "--disable-llm-semantics",
+        dest="use_llm_semantics",
+        action="store_false",
+    )
+    parser.set_defaults(use_llm_semantics=bool(defaults.get("use_llm_semantics", True)))
     parser.add_argument("--llm-model-size", choices=sorted(MODEL_PATHS), default=defaults.get("llm_model_size", "8b"))
     parser.add_argument(
         "--use-llm-path-scoring",

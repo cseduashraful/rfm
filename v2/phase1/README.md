@@ -23,6 +23,8 @@ python RFM/v2/phase1/phase1_pipeline.py \
   --config RFM/v2/phase1/phase1_config_template.yaml
 ```
 
+LLM-based semantics labeling is enabled by default. Use `--disable-llm-semantics` if you want a heuristic-only run.
+
 ## Outputs
 
 For each dataset, the pipeline writes:
