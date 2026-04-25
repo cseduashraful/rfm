@@ -568,6 +568,7 @@ def _infer_task_path_priors_with_llm(
     prompt_obj: dict[str, Any],
 ) -> dict[str, Any]:
     td = prompt_obj.get("task_definition", {})
+    graph_meta = (prompt_obj.get("semantics_summary", {}) or {}).get("semantic_context_graph", {}) or {}
     sample_paths = []
     for p in prompt_obj.get("candidate_paths", [])[:80]:
         sample_paths.append(
@@ -575,8 +576,11 @@ def _infer_task_path_priors_with_llm(
                 "path_id": p.get("path_id"),
                 "depth": p.get("depth"),
                 "path_tables": p.get("path_tables", []),
+                "matched_motif_types": p.get("matched_motif_types", []),
+                "matched_signal_families": p.get("matched_signal_families", []),
             }
         )
+    motif_samples = graph_meta.get("motif_samples", [])[:20] if isinstance(graph_meta, dict) else []
     prompt = (
         "Infer task-specific path priors for relational prediction.\n"
         "Output STRICT JSON only with keys:\n"
@@ -584,15 +588,18 @@ def _infer_task_path_priors_with_llm(
         "\"anchor_table\": str,"
         "\"preferred_motifs\": [[str,...]],"
         "\"optional_motifs\": [[str,...]],"
+        "\"preferred_signal_families\": [str],"
         "\"discouraged_tables\": [str],"
         "\"preferred_max_depth\": int,"
         "\"rationale\": str"
         "}\n"
         "Rules:\n"
         "- Use task definition + candidate path patterns.\n"
+        "- Use semantic motif samples when available.\n"
         "- Preferred motifs must be general and reusable, not path IDs.\n"
         "- Keep preferred_motifs <= 8, optional_motifs <= 8.\n"
         f"Task definition: {td}\n"
+        f"Semantic motif samples: {motif_samples}\n"
         f"Candidate path samples: {sample_paths}\n"
     )
     parsed, _ = llm.generate_json(prompt, max_new_tokens=500, retries=1)
@@ -607,6 +614,7 @@ def _infer_task_path_priors_with_llm(
             "anchor_table": anchor,
             "preferred_motifs": motifs,
             "optional_motifs": [[anchor, "results", "races"]],
+            "preferred_signal_families": ["performance", "schedule"],
             "discouraged_tables": [],
             "preferred_max_depth": 3,
             "rationale": "fallback_priors",
@@ -614,6 +622,7 @@ def _infer_task_path_priors_with_llm(
     parsed.setdefault("anchor_table", str(td.get("entity_table", "")))
     parsed.setdefault("preferred_motifs", [])
     parsed.setdefault("optional_motifs", [])
+    parsed.setdefault("preferred_signal_families", [])
     parsed.setdefault("discouraged_tables", [])
     parsed.setdefault("preferred_max_depth", 3)
     parsed.setdefault("rationale", "llm_inferred")
@@ -626,6 +635,7 @@ def _apply_task_path_priors(
 ) -> None:
     preferred = priors.get("preferred_motifs", [])
     optional = priors.get("optional_motifs", [])
+    preferred_signal_families = {str(x).lower() for x in priors.get("preferred_signal_families", [])}
     discouraged = {str(x).lower() for x in priors.get("discouraged_tables", [])}
     pref_max_depth = int(priors.get("preferred_max_depth", 3))
 
@@ -652,6 +662,10 @@ def _apply_task_path_priors(
             for m in optional:
                 if isinstance(m, list):
                     bonus += motif_match_score(tables, m, 1.5)
+        if preferred_signal_families:
+            path_families = {str(x).lower() for x in p.get("matched_signal_families", [])}
+            if preferred_signal_families & path_families:
+                bonus += 1.5
         if any(str(t).lower() in discouraged for t in tables):
             bonus -= 2.0
         if isinstance(depth, int) and depth > pref_max_depth:
@@ -754,6 +768,8 @@ def _make_table_profiles(
                 "semantic_role": c.get("semantic_role"),
                 "leakage_risk": c.get("leakage_risk", False),
                 "confidence": c.get("confidence"),
+                "predictive_value": c.get("predictive_value", "low"),
+                "aggregation_hints": list(c.get("aggregation_hints", []) or []),
             }
         sem_by_table[tname] = col_map
 
@@ -782,8 +798,68 @@ def _make_table_profiles(
                 "leakage_risk": sem_meta.get("leakage_risk", False),
                 "numeric": st_meta.get("numeric", False),
                 "missingness": st_meta.get("missingness"),
+                "predictive_value": sem_meta.get("predictive_value", "low"),
+                "aggregation_hints": sem_meta.get("aggregation_hints", []),
             }
     return merged
+
+
+def _make_table_semantic_priors(
+    semantics: dict[str, Any],
+    semantic_graph: dict[str, Any],
+) -> dict[str, dict[str, Any]]:
+    priors: dict[str, dict[str, Any]] = {}
+    for table in semantics.get("tables", []):
+        tname = str(table.get("table_name", ""))
+        priors[tname] = {
+            "table_role": table.get("table_role", "entity"),
+            "row_grain": table.get("row_grain"),
+            "temporal_kind": table.get("temporal_kind", "none"),
+            "usable_for_recency": bool(table.get("usable_for_recency", False)),
+            "primary_subject_entities": list(table.get("primary_subject_entities", []) or []),
+            "signal_families": list(table.get("signal_families", []) or []),
+            "anchor_strength": float(table.get("anchor_strength", 0.5) or 0.5),
+            "history_value": float(table.get("history_value", 0.0) or 0.0),
+            "table_summary": table.get("table_summary"),
+            "important_columns": list(table.get("important_columns", []) or []),
+        }
+    for node in semantic_graph.get("table_nodes", []) if isinstance(semantic_graph, dict) else []:
+        tname = str(node.get("table_name", ""))
+        priors.setdefault(tname, {})
+        priors[tname].update(
+            {
+                "table_role": node.get("table_role", priors[tname].get("table_role", "entity")),
+                "row_grain": node.get("row_grain", priors[tname].get("row_grain")),
+                "temporal_kind": node.get("temporal_kind", priors[tname].get("temporal_kind", "none")),
+                "usable_for_recency": bool(node.get("usable_for_recency", priors[tname].get("usable_for_recency", False))),
+                "primary_subject_entities": list(
+                    node.get("primary_subject_entities", priors[tname].get("primary_subject_entities", [])) or []
+                ),
+                "signal_families": list(node.get("signal_families", priors[tname].get("signal_families", [])) or []),
+                "anchor_strength": float(node.get("anchor_strength", priors[tname].get("anchor_strength", 0.5)) or 0.5),
+                "history_value": float(node.get("history_value", priors[tname].get("history_value", 0.0)) or 0.0),
+                "table_summary": node.get("table_summary", priors[tname].get("table_summary")),
+                "important_columns": list(node.get("important_columns", priors[tname].get("important_columns", [])) or []),
+                "trusted_measure_columns": list(node.get("trusted_measure_columns", []) or []),
+            }
+        )
+    return priors
+
+
+def _infer_task_signal_families(task_name: str, output_col: str) -> set[str]:
+    text = f"{task_name} {output_col}".lower()
+    families: set[str] = set()
+    if any(tok in text for tok in ["point", "position", "rank", "win", "lap", "fastest", "score"]):
+        families.add("performance")
+    if any(tok in text for tok in ["status", "dnf", "finish", "outcome"]):
+        families.add("status")
+    if any(tok in text for tok in ["country", "nationality", "location", "circuit"]):
+        families.add("geography")
+    if any(tok in text for tok in ["driver", "constructor", "customer", "user", "profile"]):
+        families.add("profile")
+    if any(tok in text for tok in ["date", "time", "season", "round", "race", "recent"]):
+        families.add("schedule")
+    return families
 
 
 def _suggest_aggregations(column_name: str, numeric: bool, semantic_role: str | None) -> list[str]:
@@ -806,6 +882,9 @@ def _score_column_relevance(
     semantic_role: str | None,
     numeric: bool,
     leakage_risk: bool,
+    predictive_value: str | None,
+    table_signal_families: list[str],
+    task_signal_families: set[str],
     task_name: str,
     output_col: str,
 ) -> float:
@@ -818,6 +897,10 @@ def _score_column_relevance(
     name_tokens = set(re.findall(r"[a-z0-9]+", f"{tname} {cname}"))
     name_tokens = {t for t in name_tokens if len(t) >= 3}
     score = 0.0
+    if predictive_value == "high":
+        score += 2.6
+    elif predictive_value == "medium":
+        score += 1.3
     if semantic_role == "measure":
         score += 2.0
     if numeric:
@@ -826,12 +909,16 @@ def _score_column_relevance(
         score -= 4.0
     if semantic_role == "id" or cname.endswith("id"):
         score -= 3.0
-    if semantic_role in {"timestamp", "text"}:
+    if semantic_role == "timestamp":
+        score -= 0.8
+    if semantic_role == "text":
         score -= 1.5
     if out_l and out_l in cname:
         score += 4.0
     overlap = len(tokens & name_tokens)
     score += 1.4 * min(overlap, 4)
+    family_overlap = len(set(table_signal_families) & set(task_signal_families))
+    score += 0.9 * min(family_overlap, 2)
     return score
 
 
@@ -913,13 +1000,17 @@ def _build_compilation_context(
         return expanded
 
     task_tokens = _tokens(task_name) | _tokens(task_def.output_col)
+    task_signal_families = _infer_task_signal_families(task_name, task_def.output_col)
 
     table_profiles = _make_table_profiles(stats, semantics)
+    table_semantic_priors = _make_table_semantic_priors(semantics, semantic_graph)
+    graph_motifs = semantic_graph.get("motifs", []) if isinstance(semantic_graph, dict) else []
 
     table_predictive_score: dict[str, float] = {}
     for tname, cols in table_profiles.items():
         t_low = str(tname).lower()
         t_tokens = _tokens(t_low)
+        priors = table_semantic_priors.get(tname, {})
         name_overlap = len(task_tokens & t_tokens)
         measure_hits = 0
         lexical_hits = 0
@@ -929,11 +1020,30 @@ def _build_compilation_context(
                 lexical_hits += 1
             if str(meta.get("semantic_role", "")) == "measure" and not bool(meta.get("leakage_risk", False)):
                 measure_hits += 1
+        family_overlap = len(task_signal_families & set(priors.get("signal_families", [])))
         table_predictive_score[tname] = (
-            0.9 * min(name_overlap, 3)
-            + 0.6 * min(lexical_hits, 6)
+            0.85 * min(name_overlap, 3)
+            + 0.55 * min(lexical_hits, 6)
             + 0.15 * min(measure_hits, 10)
+            + 1.10 * float(priors.get("history_value", 0.0))
+            + 0.80 * float(priors.get("anchor_strength", 0.0))
+            + 0.70 * min(family_overlap, 2)
+            + (2.0 if t_low == entity_table_l else 0.0)
         )
+
+    def _matched_motifs(path_tables: list[str]) -> list[dict[str, Any]]:
+        tables_l = [str(t).lower() for t in path_tables]
+        hits: list[dict[str, Any]] = []
+        for motif in graph_motifs if isinstance(graph_motifs, list) else []:
+            motif_tables = [str(t).lower() for t in motif.get("tables", [])]
+            if not motif_tables:
+                continue
+            if len(motif_tables) <= len(tables_l) and tables_l[: len(motif_tables)] == motif_tables:
+                hits.append(motif)
+            elif all(table in tables_l for table in motif_tables):
+                hits.append(motif)
+        hits.sort(key=lambda motif: float(motif.get("motif_weight", 0.0)), reverse=True)
+        return hits[:5]
 
     def _path_relevance_score(
         path_tables: list[str],
@@ -951,9 +1061,22 @@ def _build_compilation_context(
         if entity_table_l in tables:
             score += 3.0
 
-        # Generic task-conditioned scoring based on output/task token overlap.
-        for t in path_tables:
-            score += 0.45 * float(table_predictive_score.get(str(t), 0.0))
+        motif_hits = _matched_motifs(path_tables)
+        if motif_hits:
+            score += 1.8 * float(motif_hits[0].get("motif_weight", 0.0))
+            score += 0.45 * len(motif_hits)
+
+        for idx, t in enumerate(path_tables):
+            priors = table_semantic_priors.get(str(t), {})
+            signal_overlap = len(task_signal_families & set(priors.get("signal_families", [])))
+            score += 0.40 * float(table_predictive_score.get(str(t), 0.0))
+            score += 0.55 * min(signal_overlap, 2)
+            if idx == 0:
+                score += 0.70 * float(priors.get("anchor_strength", 0.0))
+            else:
+                score += 0.95 * float(priors.get("history_value", 0.0))
+                if bool(priors.get("usable_for_recency", False)):
+                    score += 0.35
 
         if len(path_tables) >= 2:
             hop1 = str(path_tables[1]).lower()
@@ -971,6 +1094,12 @@ def _build_compilation_context(
             score += 2.0 * (sum(edge_w) / max(1, len(edge_w)) - 0.5)
             if any(str(e.get("direction", "")).lower() == "parent_to_child" for e in path_edges):
                 score -= 0.2
+            score -= 0.45 * sum(float(e.get("fanout_risk", 0.0)) for e in path_edges)
+            score += 0.25 * sum(float(e.get("signal_overlap", 0.5)) for e in path_edges)
+            if any("history" in str(e.get("temporal_join_semantics", "")) for e in path_edges):
+                score += 0.5
+            if any(str(e.get("relation_type", "")) == "one_to_many" for e in path_edges):
+                score -= 0.3
 
         if isinstance(depth, int):
             # Strongly prefer compact paths for predictive stability.
@@ -1014,6 +1143,14 @@ def _build_compilation_context(
                 "confidence": str(e.get("confidence", "medium")),
                 "direction": str(e.get("direction", "unknown")),
                 "edge_weight": ew,
+                "relation_type": str(e.get("relation_type", "unknown")),
+                "join_cardinality": str(e.get("join_cardinality", "unknown")),
+                "fanout_risk": float(e.get("fanout_risk", 0.0)),
+                "temporal_join_semantics": str(e.get("temporal_join_semantics", "")),
+                "traversal_semantics": str(e.get("traversal_semantics", "")),
+                "preferred_aggregations": list(e.get("preferred_aggregations", []) or []),
+                "shared_subject_entities": list(e.get("shared_subject_entities", []) or []),
+                "signal_overlap": float(e.get("signal_overlap", 0.5)),
             }
             adjacency.setdefault(src, []).append(edge)
             adjacency.setdefault(dst, adjacency.get(dst, []))
@@ -1038,6 +1175,14 @@ def _build_compilation_context(
                     "confidence": "high",
                     "direction": "child_to_parent",
                     "edge_weight": 0.85,
+                    "relation_type": "many_to_one",
+                    "join_cardinality": "many_to_one",
+                    "fanout_risk": 0.35,
+                    "temporal_join_semantics": "lookup_context",
+                    "traversal_semantics": "resolve_reference_context",
+                    "preferred_aggregations": ["count", "mean", "max"],
+                    "shared_subject_entities": [],
+                    "signal_overlap": 0.5,
                 }
                 edge_rev = {
                     "src_table": parent_table,
@@ -1049,6 +1194,14 @@ def _build_compilation_context(
                     "confidence": "high",
                     "direction": "parent_to_child",
                     "edge_weight": 0.78,
+                    "relation_type": "one_to_many",
+                    "join_cardinality": "one_to_many",
+                    "fanout_risk": 0.35,
+                    "temporal_join_semantics": "expand_context_into_history",
+                    "traversal_semantics": "expand_history",
+                    "preferred_aggregations": ["count", "last"],
+                    "shared_subject_entities": [],
+                    "signal_overlap": 0.5,
                 }
                 adjacency[child].append(edge_fwd)
                 adjacency[parent_table].append(edge_rev)
@@ -1061,7 +1214,13 @@ def _build_compilation_context(
             continue
         ew = float(e.get("edge_weight", 0.6))
         rec = 1.0 if bool(e.get("recommended_by_default", True)) else 0.0
-        score = 0.65 * ew + 0.35 * rec + 0.40 * float(table_predictive_score.get(dst, 0.0))
+        score = (
+            0.60 * ew
+            + 0.35 * rec
+            + 0.35 * float(table_predictive_score.get(dst, 0.0))
+            + 0.35 * float(table_semantic_priors.get(dst, {}).get("history_value", 0.0))
+            + 0.20 * len(task_signal_families & set(table_semantic_priors.get(dst, {}).get("signal_families", [])))
+        )
         first_hop_scores.append((dst.lower(), score))
     first_hop_scores.sort(key=lambda x: x[1], reverse=True)
     first_hop_preferred = {t for t, _ in first_hop_scores[:4]}
@@ -1120,6 +1279,17 @@ def _build_compilation_context(
             "recommended": recommended,
             "temporal_valid": temporal_valid,
         }
+        motif_hits = _matched_motifs(compact["path_tables"])
+        compact["matched_motif_ids"] = [str(motif.get("motif_id", "")) for motif in motif_hits if motif.get("motif_id")]
+        compact["matched_motif_types"] = [str(motif.get("motif_type", "")) for motif in motif_hits if motif.get("motif_type")]
+        compact["matched_signal_families"] = sorted(
+            {
+                str(family)
+                for motif in motif_hits
+                for family in (motif.get("signal_families", []) or [])
+                if str(family)
+            }
+        )[:8]
         compact["relevance_score"] = _path_relevance_score(
             compact["path_tables"],
             compact["path_edges"],
@@ -1132,6 +1302,7 @@ def _build_compilation_context(
 
         attr_candidates: list[dict[str, Any]] = []
         for tname in compact["path_tables"]:
+            table_priors = table_semantic_priors.get(str(tname), {})
             for cname, meta in table_profiles.get(str(tname), {}).items():
                 rel = _score_column_relevance(
                     table_name=str(tname),
@@ -1139,9 +1310,14 @@ def _build_compilation_context(
                     semantic_role=meta.get("semantic_role"),
                     numeric=bool(meta.get("numeric", False)),
                     leakage_risk=bool(meta.get("leakage_risk", False)),
+                    predictive_value=meta.get("predictive_value"),
+                    table_signal_families=list(table_priors.get("signal_families", [])),
+                    task_signal_families=task_signal_families,
                     task_name=task_name,
                     output_col=task_def.output_col,
                 )
+                if str(cname) in set(table_priors.get("important_columns", [])):
+                    rel += 0.8
                 if rel <= 0:
                     continue
                 attr_candidates.append(
@@ -1151,7 +1327,9 @@ def _build_compilation_context(
                         "importance_score": round(float(rel), 3),
                         "semantic_role": meta.get("semantic_role"),
                         "numeric": bool(meta.get("numeric", False)),
-                        "suggested_aggregations": _suggest_aggregations(
+                        "predictive_value": meta.get("predictive_value", "low"),
+                        "suggested_aggregations": list(meta.get("aggregation_hints", []) or [])
+                        or _suggest_aggregations(
                             str(cname),
                             bool(meta.get("numeric", False)),
                             meta.get("semantic_role"),
@@ -1197,10 +1375,40 @@ def _build_compilation_context(
             t.get("table_name", ""): t.get("table_role", "")
             for t in semantics.get("tables", [])
         },
+        "task_signal_families": sorted(task_signal_families),
+        "top_anchor_tables": [
+            t
+            for t, _ in sorted(
+                ((tname, float(meta.get("anchor_strength", 0.0))) for tname, meta in table_semantic_priors.items()),
+                key=lambda kv: kv[1],
+                reverse=True,
+            )[:8]
+        ],
+        "top_history_tables": [
+            t
+            for t, _ in sorted(
+                ((tname, float(meta.get("history_value", 0.0))) for tname, meta in table_semantic_priors.items()),
+                key=lambda kv: kv[1],
+                reverse=True,
+            )[:8]
+        ],
         "semantic_context_graph": {
             "used_for_enumeration": used_semantic_graph,
             "node_count": int(semantic_graph.get("node_count", 0)) if isinstance(semantic_graph, dict) else 0,
             "edge_count": int(semantic_graph.get("edge_count", 0)) if isinstance(semantic_graph, dict) else 0,
+            "motif_count": int(semantic_graph.get("motif_count", 0)) if isinstance(semantic_graph, dict) else 0,
+            "motif_samples": [
+                {
+                    "motif_id": motif.get("motif_id"),
+                    "tables": motif.get("tables", []),
+                    "motif_type": motif.get("motif_type"),
+                    "signal_families": motif.get("signal_families", []),
+                    "core_attributes": motif.get("core_attributes", [])[:6],
+                    "temporal_support": motif.get("temporal_support"),
+                    "motif_weight": motif.get("motif_weight"),
+                }
+                for motif in (graph_motifs[:20] if isinstance(graph_motifs, list) else [])
+            ],
         },
     }
 

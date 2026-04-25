@@ -34,8 +34,12 @@ from phase1_utils import (
     is_temporal_dtype_name,
     is_text_dtype_name,
     normalize_identifier_tokens,
+    singularize_identifier,
     write_json as _write_json,
 )
+
+ALLOWED_TEMPORAL_KINDS = {"none", "event_time", "attribute_time", "snapshot_time", "mixed_time"}
+ALLOWED_PREDICTIVE_VALUES = {"high", "medium", "low"}
 
 
 @dataclass
@@ -583,26 +587,43 @@ class Phase1Pipeline:
         table_name: str,
         schema_table: dict[str, Any],
         stats_table: dict[str, Any],
+        col_specs: list[dict[str, Any]],
     ) -> str:
         lower = table_name.lower()
         time_column = schema_table.get("time_column")
         provided_fks = schema_table.get("provided_foreign_keys", {}) or {}
         columns = schema_table.get("columns", [])
         row_count = int(stats_table.get("row_count", schema_table.get("row_count", 0)) or 0)
-        if time_column is None:
-            if len(provided_fks) >= 2 and len(columns) <= len(provided_fks) + 4:
-                return "bridge"
-            return "static"
-        if any(tok in lower for tok in {"event", "log", "history", "fact", "transaction"}) or lower.endswith("s"):
-            return "event"
-        if len(provided_fks) >= 2 and len(columns) <= len(provided_fks) + 5:
+        role_counts: dict[str, int] = {}
+        for spec in col_specs:
+            role = str(spec.get("heuristic_prior_role", "other"))
+            role_counts[role] = role_counts.get(role, 0) + 1
+        text_like = role_counts.get("text", 0) + role_counts.get("category", 0) + role_counts.get("status", 0)
+        measure_like = role_counts.get("measure", 0)
+
+        if len(provided_fks) >= 2 and len(columns) <= len(provided_fks) + 5 and measure_like <= max(3, len(provided_fks)):
             return "bridge"
-        low_card_cols = 0
-        for column_name, column_meta in (stats_table.get("columns", {}) or {}).items():
-            distinct_count = column_meta.get("distinct_count")
-            if distinct_count is not None and row_count > 0 and int(distinct_count) <= min(50, max(5, int(0.02 * row_count))):
-                low_card_cols += 1
-        if row_count > 0 and low_card_cols >= max(2, len(columns) // 2):
+        if time_column is None:
+            if len(provided_fks) == 0 and measure_like == 0 and text_like >= max(2, len(columns) // 2):
+                return "entity" if row_count > 250 else "static"
+            if len(provided_fks) == 0:
+                return "static"
+            if text_like >= measure_like + 1:
+                return "lookup"
+            return "static"
+
+        time_low = str(time_column).lower()
+        if any(tok in time_low for tok in ["dob", "birth", "founded", "created"]):
+            return "entity"
+        if any(tok in lower for tok in ["lookup", "reference", "dimension", "catalog", "code"]):
+            return "lookup"
+        if any(tok in lower for tok in ["event", "log", "history", "fact", "transaction", "result", "qualifying"]):
+            return "event"
+        if measure_like >= max(2, text_like) or (len(provided_fks) >= 1 and measure_like >= 1):
+            return "event"
+        if len(provided_fks) == 0 and text_like >= max(2, measure_like + 1):
+            return "entity"
+        if row_count > 0 and text_like >= max(2, len(columns) // 2):
             return "lookup"
         return "entity"
 
@@ -667,13 +688,331 @@ class Phase1Pipeline:
         return {
             "name": column_name,
             "dtype": dtype_name,
+            "numeric": bool(is_numeric_dtype_name(dtype_name)),
             "non_null": non_null,
             "missing_ratio": column_stats.get("missingness"),
             "unique": unique,
             "unique_ratio": (float(unique) / max(1, non_null)) if unique is not None and non_null > 0 else 0.0,
             "heuristic_prior_role": heuristic_role,
+            "heuristic_predictive_value": self._heuristic_predictive_value(
+                column_name=column_name,
+                heuristic_role=heuristic_role,
+                dtype_name=dtype_name,
+            ),
+            "heuristic_aggregation_hints": self._heuristic_aggregation_hints(
+                column_name=column_name,
+                numeric=bool(is_numeric_dtype_name(dtype_name)),
+                semantic_role=heuristic_role,
+            ),
             "top_values": top_values,
             "numeric_range": numeric_range,
+        }
+
+    def _heuristic_predictive_value(
+        self,
+        *,
+        column_name: str,
+        heuristic_role: str,
+        dtype_name: str,
+    ) -> str:
+        low = column_name.lower()
+        if heuristic_role == "id" or low.endswith("id"):
+            return "low"
+        if any(tok in low for tok in ["label", "target", "future", "leak", "outcome"]):
+            return "low"
+        if heuristic_role == "measure":
+            if any(tok in low for tok in ["point", "position", "rank", "win", "lap", "millisecond", "fastest", "score"]):
+                return "high"
+            return "medium"
+        if heuristic_role == "status":
+            return "medium"
+        if heuristic_role == "category":
+            return "medium"
+        if heuristic_role == "timestamp":
+            return "medium" if any(tok in low for tok in ["date", "timestamp"]) else "low"
+        if heuristic_role == "text":
+            if any(tok in low for tok in ["name", "title", "description"]):
+                return "low"
+            return "low"
+        if is_numeric_dtype_name(dtype_name):
+            return "medium"
+        return "low"
+
+    def _heuristic_aggregation_hints(
+        self,
+        *,
+        column_name: str,
+        numeric: bool,
+        semantic_role: str,
+    ) -> list[str]:
+        low = column_name.lower()
+        if semantic_role == "timestamp":
+            return ["last", "recent_count", "delta"]
+        if not numeric:
+            if semantic_role == "status":
+                return ["count", "mode", "last"]
+            if semantic_role == "category":
+                return ["count", "nunique", "mode"]
+            return ["count"]
+        if any(tok in low for tok in ["position", "order", "grid", "rank"]):
+            return ["mean", "min", "max", "std", "last", "delta"]
+        if any(tok in low for tok in ["point", "win", "lap", "millisecond", "fastest", "score"]):
+            return ["mean", "sum", "std", "max", "last", "delta"]
+        return ["mean", "std", "min", "max", "sum"]
+
+    def _normalize_signal_families(self, values: Any) -> list[str]:
+        if not isinstance(values, list):
+            return []
+        out: list[str] = []
+        for value in values:
+            token = "_".join(re.findall(r"[a-z0-9]+", str(value).lower()))
+            if len(token) < 3 or token in out:
+                continue
+            out.append(token)
+        return out[:8]
+
+    def _normalize_predictive_value(self, value: Any, fallback: str) -> str:
+        value_s = str(value or "").strip().lower()
+        if value_s in ALLOWED_PREDICTIVE_VALUES:
+            return value_s
+        return fallback
+
+    def _normalize_aggregation_hints(self, payload: Any, fallback: list[str]) -> list[str]:
+        if not isinstance(payload, list):
+            return list(fallback)
+        out: list[str] = []
+        for item in payload:
+            token = "_".join(re.findall(r"[a-z0-9]+", str(item).lower()))
+            if len(token) < 2 or token in out:
+                continue
+            out.append(token)
+        return out[:8] or list(fallback)
+
+    def _infer_signal_families(
+        self,
+        table_name: str,
+        col_specs: list[dict[str, Any]],
+    ) -> list[str]:
+        families: set[str] = set()
+        for spec in col_specs:
+            low = str(spec.get("name", "")).lower()
+            role = str(spec.get("heuristic_prior_role", "other"))
+            if any(tok in low for tok in ["point", "position", "rank", "win", "lap", "millisecond", "fastest", "grid"]):
+                families.add("performance")
+            if role == "status" or "status" in low or "state" in low:
+                families.add("status")
+            if any(tok in low for tok in ["nationality", "country", "location", "lat", "lng", "circuit"]):
+                families.add("geography")
+            if any(tok in low for tok in ["name", "surname", "forename", "driverref", "constructorref", "code", "dob", "birth"]):
+                families.add("profile")
+            if any(tok in low for tok in ["date", "time", "year", "round", "season"]):
+                families.add("schedule")
+            if role == "text" and any(tok in low for tok in ["note", "comment", "description"]):
+                families.add("narrative")
+        if not families:
+            name_tokens = normalize_identifier_tokens(table_name)
+            if "result" in name_tokens or "qualifying" in name_tokens:
+                families.add("performance")
+            elif "stand" in name_tokens:
+                families.add("status")
+        return sorted(families)[:6]
+
+    def _primary_subject_entities(
+        self,
+        table_name: str,
+        schema_table: dict[str, Any],
+    ) -> list[str]:
+        subjects: list[str] = []
+        singular = singularize_identifier(table_name)
+        if singular and singular not in subjects:
+            subjects.append(singular)
+        for parent in (schema_table.get("provided_foreign_keys", {}) or {}).values():
+            parent_name = singularize_identifier(str(parent))
+            if parent_name and parent_name not in subjects:
+                subjects.append(parent_name)
+        return subjects[:6]
+
+    def _infer_temporal_kind(
+        self,
+        *,
+        table_role: str,
+        schema_table: dict[str, Any],
+    ) -> str:
+        time_column = schema_table.get("time_column")
+        if not time_column:
+            return "none"
+        time_low = str(time_column).lower()
+        detected = [str(v).lower() for v in schema_table.get("detected_time_columns", [])]
+        if any(tok in time_low for tok in ["dob", "birth", "founded", "created"]):
+            return "attribute_time"
+        if any(tok in time_low for tok in ["snapshot", "asof", "effective"]):
+            return "snapshot_time"
+        companion = {time_low, "date", "time", "timestamp", "datetime"}
+        if len(detected) >= 2 and any(col not in companion for col in detected):
+            return "mixed_time"
+        if table_role in {"entity", "lookup", "static"}:
+            return "attribute_time"
+        return "event_time"
+
+    def _row_grain(
+        self,
+        *,
+        table_name: str,
+        table_role: str,
+        schema_table: dict[str, Any],
+    ) -> str:
+        singular = singularize_identifier(table_name)
+        fk_targets = [
+            singularize_identifier(str(parent))
+            for parent in (schema_table.get("provided_foreign_keys", {}) or {}).values()
+        ]
+        fk_targets = [v for v in fk_targets if v]
+        if table_role == "bridge" and fk_targets:
+            return f"one row per {'-'.join(fk_targets[:3])} linkage record"
+        if table_role == "event":
+            time_column = schema_table.get("time_column")
+            if time_column:
+                return f"one row per {singular} event at {time_column}"
+            return f"one row per {singular} event"
+        if table_role == "entity":
+            return f"one row per {singular}"
+        if table_role in {"lookup", "static"}:
+            return f"reference row for {singular}"
+        return f"row keyed by {schema_table.get('provided_primary_key') or singular}"
+
+    def _anchor_strength(
+        self,
+        *,
+        table_role: str,
+        schema_table: dict[str, Any],
+        temporal_kind: str,
+        signal_families: list[str],
+    ) -> float:
+        base = {
+            "entity": 0.88,
+            "lookup": 0.62,
+            "static": 0.50,
+            "event": 0.42,
+            "bridge": 0.28,
+        }.get(table_role, 0.45)
+        if schema_table.get("provided_primary_key"):
+            base += 0.04
+        if temporal_kind == "event_time":
+            base -= 0.08
+        if "profile" in signal_families:
+            base += 0.04
+        return round(max(0.0, min(1.0, base)), 3)
+
+    def _history_value(
+        self,
+        *,
+        table_role: str,
+        temporal_kind: str,
+        signal_families: list[str],
+    ) -> float:
+        base = {
+            "event_time": 0.92,
+            "snapshot_time": 0.75,
+            "mixed_time": 0.68,
+            "attribute_time": 0.22,
+            "none": 0.10,
+        }.get(temporal_kind, 0.20)
+        if table_role == "bridge":
+            base += 0.05
+        if "performance" in signal_families or "status" in signal_families:
+            base += 0.08
+        return round(max(0.0, min(1.0, base)), 3)
+
+    def _table_summary(
+        self,
+        *,
+        table_name: str,
+        table_role: str,
+        temporal_kind: str,
+        row_grain: str,
+        signal_families: list[str],
+        primary_subject_entities: list[str],
+    ) -> str:
+        signals = ", ".join(signal_families[:3]) if signal_families else "general context"
+        subjects = ", ".join(primary_subject_entities[:3]) if primary_subject_entities else singularize_identifier(table_name)
+        return (
+            f"{table_name} is a {table_role} table with {row_grain}. "
+            f"Temporal meaning: {temporal_kind}. "
+            f"Primary subjects: {subjects}. "
+            f"Main signal families: {signals}."
+        )
+
+    def _important_columns(self, columns: list[dict[str, Any]]) -> list[str]:
+        ranked = sorted(
+            columns,
+            key=lambda col: (
+                {"high": 2, "medium": 1, "low": 0}.get(str(col.get("predictive_value", "low")), 0),
+                str(col.get("semantic_role", "")) == "measure",
+                str(col.get("semantic_role", "")) == "status",
+                str(col.get("semantic_role", "")) == "timestamp",
+            ),
+            reverse=True,
+        )
+        out: list[str] = []
+        for col in ranked:
+            name = str(col.get("name", ""))
+            if not name or name in out:
+                continue
+            if str(col.get("semantic_role")) == "id" and len(out) >= 2:
+                continue
+            out.append(name)
+            if len(out) >= 8:
+                break
+        return out
+
+    def _heuristic_table_semantic_profile(
+        self,
+        *,
+        table_name: str,
+        schema_table: dict[str, Any],
+        stats_table: dict[str, Any],
+        col_specs: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        table_role = self._table_role(table_name, schema_table, stats_table, col_specs)
+        temporal_kind = self._infer_temporal_kind(table_role=table_role, schema_table=schema_table)
+        signal_families = self._infer_signal_families(table_name, col_specs)
+        primary_subject_entities = self._primary_subject_entities(table_name, schema_table)
+        row_grain = self._row_grain(table_name=table_name, table_role=table_role, schema_table=schema_table)
+        anchor_strength = self._anchor_strength(
+            table_role=table_role,
+            schema_table=schema_table,
+            temporal_kind=temporal_kind,
+            signal_families=signal_families,
+        )
+        history_value = self._history_value(
+            table_role=table_role,
+            temporal_kind=temporal_kind,
+            signal_families=signal_families,
+        )
+        feature_time_columns = [
+            col
+            for col in schema_table.get("detected_time_columns", [])
+            if col and col != schema_table.get("time_column")
+        ]
+        return {
+            "table_role": table_role,
+            "row_grain": row_grain,
+            "temporal_kind": temporal_kind,
+            "filter_time_column": schema_table.get("time_column"),
+            "feature_time_columns": feature_time_columns,
+            "usable_for_recency": temporal_kind in {"event_time", "snapshot_time", "mixed_time"},
+            "primary_subject_entities": primary_subject_entities,
+            "signal_families": signal_families,
+            "anchor_strength": anchor_strength,
+            "history_value": history_value,
+            "table_summary": self._table_summary(
+                table_name=table_name,
+                table_role=table_role,
+                temporal_kind=temporal_kind,
+                row_grain=row_grain,
+                signal_families=signal_families,
+                primary_subject_entities=primary_subject_entities,
+            ),
         }
 
     def _build_semantics_artifact(
@@ -697,7 +1036,6 @@ class Phase1Pipeline:
         for schema_table in schema_artifact.get("tables", []):
             table_name = str(schema_table.get("table_name", ""))
             stats_table = stats_by_table.get(table_name, {})
-            table_role = self._table_role(table_name, schema_table, stats_table)
             col_specs = [
                 self._column_prior_info(
                     column_name=str(column.get("name", "")),
@@ -706,12 +1044,18 @@ class Phase1Pipeline:
                 )
                 for column in schema_table.get("columns", [])
             ]
+            heuristic_profile = self._heuristic_table_semantic_profile(
+                table_name=table_name,
+                schema_table=schema_table,
+                stats_table=stats_table,
+                col_specs=col_specs,
+            )
             llm_result: dict[str, Any] | None = None
             if llm is not None:
                 llm_result, diag = self._annotate_table_semantics_with_llm(
                     llm=llm,
                     table_name=table_name,
-                    heuristic_table_role=table_role,
+                    heuristic_profile=heuristic_profile,
                     provided_time_col=schema_table.get("time_column"),
                     column_specs=col_specs,
                 )
@@ -722,17 +1066,35 @@ class Phase1Pipeline:
                     llm_failures += 1
 
             columns = []
-            spec_by_name = {spec["name"]: spec for spec in col_specs}
+            table_role = str(heuristic_profile["table_role"])
+            temporal_kind = str(heuristic_profile["temporal_kind"])
+            row_grain = str(heuristic_profile["row_grain"])
+            feature_time_columns = list(heuristic_profile["feature_time_columns"])
+            primary_subject_entities = list(heuristic_profile["primary_subject_entities"])
+            signal_families = list(heuristic_profile["signal_families"])
+            anchor_strength = float(heuristic_profile["anchor_strength"])
+            history_value = float(heuristic_profile["history_value"])
+            table_summary = str(heuristic_profile["table_summary"])
             if llm_result is not None:
                 llm_table_role = self._normalize_table_role(llm_result.get("table_role"), table_role)
                 table_role_conf = float(llm_result.get("table_role_confidence", 0.0))
                 if table_role_conf >= self.config.llm_semantics_confidence_threshold:
                     table_role = llm_table_role
+                temporal_kind = str(llm_result.get("temporal_kind", temporal_kind))
+                row_grain = str(llm_result.get("row_grain", row_grain))
+                feature_time_columns = list(llm_result.get("feature_time_columns", feature_time_columns))
+                primary_subject_entities = list(llm_result.get("primary_subject_entities", primary_subject_entities))
+                signal_families = list(llm_result.get("signal_families", signal_families))
+                anchor_strength = float(llm_result.get("anchor_strength", anchor_strength))
+                history_value = float(llm_result.get("history_value", history_value))
+                table_summary = str(llm_result.get("table_summary", table_summary))
                 llm_columns = llm_result.get("columns", {})
                 for spec in col_specs:
                     column_name = spec["name"]
                     col_info = llm_columns.get(column_name, {})
                     heuristic_role = spec["heuristic_prior_role"]
+                    heuristic_predictive = spec["heuristic_predictive_value"]
+                    heuristic_aggs = spec["heuristic_aggregation_hints"]
                     llm_role = self._normalize_column_role(col_info.get("semantic_role"), heuristic_role)
                     llm_role = self._semantic_rule_override(column_name, llm_role, heuristic_role)
                     llm_conf = float(col_info.get("confidence", 0.0))
@@ -740,9 +1102,19 @@ class Phase1Pipeline:
                     if llm_abstain or llm_conf < self.config.llm_semantics_confidence_threshold:
                         role = heuristic_role
                         confidence = "merged_low_conf_fallback"
+                        predictive_value = heuristic_predictive
+                        aggregation_hints = heuristic_aggs
                     else:
                         role = llm_role
                         confidence = "llm"
+                        predictive_value = self._normalize_predictive_value(
+                            col_info.get("predictive_value"),
+                            heuristic_predictive,
+                        )
+                        aggregation_hints = self._normalize_aggregation_hints(
+                            col_info.get("aggregation_hints"),
+                            heuristic_aggs,
+                        )
                     leakage_risk = bool(
                         col_info.get(
                             "leakage_risk",
@@ -754,6 +1126,8 @@ class Phase1Pipeline:
                             "name": column_name,
                             "semantic_role": role,
                             "leakage_risk": leakage_risk,
+                            "predictive_value": predictive_value,
+                            "aggregation_hints": aggregation_hints,
                             "confidence": confidence,
                             "llm_confidence": llm_conf,
                             "llm_abstain": llm_abstain,
@@ -770,17 +1144,33 @@ class Phase1Pipeline:
                             "name": column_name,
                             "semantic_role": role,
                             "leakage_risk": leakage_risk,
+                            "predictive_value": spec["heuristic_predictive_value"],
+                            "aggregation_hints": spec["heuristic_aggregation_hints"],
                             "confidence": "heuristic",
                             "llm_confidence": None,
                             "llm_abstain": None,
                             "heuristic_prior_role": role,
                         }
                     )
+            important_columns = list(llm_result.get("important_columns", []))[:8] if llm_result is not None else []
+            if not important_columns:
+                important_columns = self._important_columns(columns)
             tables.append(
                 {
                     "table_name": table_name,
                     "table_role": table_role,
                     "time_column": schema_table.get("time_column"),
+                    "row_grain": row_grain,
+                    "temporal_kind": temporal_kind,
+                    "filter_time_column": schema_table.get("time_column"),
+                    "feature_time_columns": feature_time_columns,
+                    "usable_for_recency": temporal_kind in {"event_time", "snapshot_time", "mixed_time"},
+                    "primary_subject_entities": primary_subject_entities,
+                    "signal_families": signal_families,
+                    "anchor_strength": round(anchor_strength, 3),
+                    "history_value": round(history_value, 3),
+                    "table_summary": table_summary,
+                    "important_columns": important_columns,
                     "columns": columns,
                 }
             )
@@ -816,6 +1206,9 @@ class Phase1Pipeline:
             table_role = str(table.get("table_role", ""))
             if table_role not in ALLOWED_TABLE_ROLES:
                 issues.append({"type": "invalid_table_role", "table": table_name, "value": table_role})
+            temporal_kind = str(table.get("temporal_kind", ""))
+            if temporal_kind not in ALLOWED_TEMPORAL_KINDS:
+                issues.append({"type": "invalid_temporal_kind", "table": table_name, "value": temporal_kind})
             for column in table.get("columns", []):
                 column_name = column.get("name", "")
                 semantic_role = str(column.get("semantic_role", ""))
@@ -826,6 +1219,16 @@ class Phase1Pipeline:
                             "table": table_name,
                             "column": column_name,
                             "value": semantic_role,
+                        }
+                    )
+                predictive_value = str(column.get("predictive_value", ""))
+                if predictive_value not in ALLOWED_PREDICTIVE_VALUES:
+                    issues.append(
+                        {
+                            "type": "invalid_predictive_value",
+                            "table": table_name,
+                            "column": column_name,
+                            "value": predictive_value,
                         }
                     )
                 lower = str(column_name).lower()
@@ -886,6 +1289,9 @@ class Phase1Pipeline:
         lower = column_name.lower()
         if lower.endswith("id") and role != "id":
             return "id"
+        if role == "id" and heuristic_role != "id" and not (lower == "id" or lower.endswith("id") or lower.endswith("_key")):
+            if any(tok in lower for tok in ["position", "order", "grid", "rank", "lap", "point", "score", "win"]):
+                return heuristic_role
         if any(tok in lower for tok in ["date", "time", "timestamp"]) and role != "timestamp":
             return "timestamp"
         if role not in ALLOWED_COLUMN_ROLES:
@@ -896,7 +1302,7 @@ class Phase1Pipeline:
         self,
         *,
         table_name: str,
-        heuristic_table_role: str,
+        heuristic_profile: dict[str, Any],
         provided_time_col: str | None,
         column_specs: list[dict[str, Any]],
         variant: str,
@@ -911,10 +1317,21 @@ class Phase1Pipeline:
             "{\n"
             '  "table_role": "entity|event|lookup|bridge|static",\n'
             '  "table_role_confidence": <float 0..1>,\n'
+            '  "row_grain": <short string>,\n'
+            '  "temporal_kind": "none|event_time|attribute_time|snapshot_time|mixed_time",\n'
+            '  "feature_time_columns": [str,...],\n'
+            '  "primary_subject_entities": [str,...],\n'
+            '  "signal_families": [str,...],\n'
+            '  "anchor_strength": <float 0..1>,\n'
+            '  "history_value": <float 0..1>,\n'
+            '  "table_summary": <short string>,\n'
+            '  "important_columns": [str,...],\n'
             '  "columns": {\n'
             '    "<col_name>": {\n'
             '      "semantic_role": "id|timestamp|measure|status|category|text|other",\n'
             '      "leakage_risk": true|false,\n'
+            '      "predictive_value": "high|medium|low",\n'
+            '      "aggregation_hints": [str,...],\n'
             '      "confidence": <float 0..1>,\n'
             '      "abstain": true|false\n'
             "    }\n"
@@ -922,7 +1339,7 @@ class Phase1Pipeline:
             "}\n"
             "No markdown, no prose.\n\n"
             f"Table name: {table_name}\n"
-            f"Heuristic table role: {heuristic_table_role}\n"
+            f"Heuristic table priors: {json.dumps(heuristic_profile, ensure_ascii=True)}\n"
             f"Provided time column: {provided_time_col}\n"
             f"Columns with priors:\n{json.dumps(column_specs, ensure_ascii=True)}\n"
         )
@@ -933,6 +1350,8 @@ class Phase1Pipeline:
             "Check internal consistency and repair invalid enums.\n"
             "Allowed table_role: entity,event,lookup,bridge,static.\n"
             "Allowed semantic_role: id,timestamp,measure,status,category,text,other.\n"
+            "Allowed temporal_kind: none,event_time,attribute_time,snapshot_time,mixed_time.\n"
+            "Allowed predictive_value: high,medium,low.\n"
             "Return STRICT JSON in the same schema as input. No markdown.\n\n"
             f"Table: {table_name}\n"
             f"Candidate JSON:\n{json.dumps(candidate_json, ensure_ascii=True)}\n"
@@ -943,11 +1362,12 @@ class Phase1Pipeline:
         *,
         parsed: dict[str, Any],
         table_name: str,
-        heuristic_table_role: str,
+        heuristic_profile: dict[str, Any],
         column_specs: list[dict[str, Any]],
     ) -> tuple[dict[str, Any], list[str]]:
         issues: list[str] = []
         out: dict[str, Any] = {"columns": {}}
+        heuristic_table_role = str(heuristic_profile.get("table_role", "entity"))
         out["table_role"] = self._normalize_table_role(parsed.get("table_role"), heuristic_table_role)
         if out["table_role"] != str(parsed.get("table_role", "")).strip().lower():
             issues.append(f"{table_name}: repaired_table_role")
@@ -956,6 +1376,34 @@ class Phase1Pipeline:
         except Exception:
             out["table_role_confidence"] = 0.0
             issues.append(f"{table_name}: invalid_table_role_confidence")
+        out["row_grain"] = str(parsed.get("row_grain") or heuristic_profile.get("row_grain", ""))
+        temporal_kind = str(parsed.get("temporal_kind") or heuristic_profile.get("temporal_kind", "none")).strip().lower()
+        if temporal_kind not in ALLOWED_TEMPORAL_KINDS:
+            temporal_kind = str(heuristic_profile.get("temporal_kind", "none"))
+            issues.append(f"{table_name}: repaired_temporal_kind")
+        out["temporal_kind"] = temporal_kind
+        out["feature_time_columns"] = [
+            str(v)
+            for v in (parsed.get("feature_time_columns") if isinstance(parsed.get("feature_time_columns"), list) else heuristic_profile.get("feature_time_columns", []))
+            if str(v)
+        ][:4]
+        out["primary_subject_entities"] = [
+            str(v)
+            for v in (parsed.get("primary_subject_entities") if isinstance(parsed.get("primary_subject_entities"), list) else heuristic_profile.get("primary_subject_entities", []))
+            if str(v)
+        ][:6]
+        out["signal_families"] = self._normalize_signal_families(
+            parsed.get("signal_families", heuristic_profile.get("signal_families", []))
+        ) or list(heuristic_profile.get("signal_families", []))
+        try:
+            out["anchor_strength"] = max(0.0, min(1.0, float(parsed.get("anchor_strength", heuristic_profile.get("anchor_strength", 0.5)))))
+        except Exception:
+            out["anchor_strength"] = float(heuristic_profile.get("anchor_strength", 0.5))
+        try:
+            out["history_value"] = max(0.0, min(1.0, float(parsed.get("history_value", heuristic_profile.get("history_value", 0.2)))))
+        except Exception:
+            out["history_value"] = float(heuristic_profile.get("history_value", 0.2))
+        out["table_summary"] = str(parsed.get("table_summary") or heuristic_profile.get("table_summary", ""))
 
         llm_columns = parsed.get("columns", {})
         if not isinstance(llm_columns, dict):
@@ -965,6 +1413,8 @@ class Phase1Pipeline:
         for spec in column_specs:
             column_name = spec["name"]
             heuristic_role = spec["heuristic_prior_role"]
+            heuristic_predictive = spec["heuristic_predictive_value"]
+            heuristic_aggs = spec["heuristic_aggregation_hints"]
             payload = llm_columns.get(column_name, {})
             if not isinstance(payload, dict):
                 payload = {}
@@ -988,7 +1438,18 @@ class Phase1Pipeline:
                 "confidence": confidence,
                 "abstain": abstain,
                 "leakage_risk": leakage_risk,
+                "predictive_value": self._normalize_predictive_value(payload.get("predictive_value"), heuristic_predictive),
+                "aggregation_hints": self._normalize_aggregation_hints(payload.get("aggregation_hints"), heuristic_aggs),
             }
+        out["important_columns"] = [
+            name
+            for name in (
+                parsed.get("important_columns")
+                if isinstance(parsed.get("important_columns"), list)
+                else list(out["columns"].keys())
+            )
+            if isinstance(name, str) and name in out["columns"]
+        ][:8]
         return out, issues
 
     def _annotate_table_semantics_with_llm(
@@ -996,7 +1457,7 @@ class Phase1Pipeline:
         *,
         llm: LocalLLM,
         table_name: str,
-        heuristic_table_role: str,
+        heuristic_profile: dict[str, Any],
         provided_time_col: str | None,
         column_specs: list[dict[str, Any]],
     ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
@@ -1021,7 +1482,7 @@ class Phase1Pipeline:
 
         primary_prompt = self._build_semantics_prompt(
             table_name=table_name,
-            heuristic_table_role=heuristic_table_role,
+            heuristic_profile=heuristic_profile,
             provided_time_col=provided_time_col,
             column_specs=column_specs,
             variant="primary",
@@ -1034,7 +1495,7 @@ class Phase1Pipeline:
         primary_sanitized, primary_issues = self._sanitize_llm_semantics_result(
             parsed=parsed_primary,
             table_name=table_name,
-            heuristic_table_role=heuristic_table_role,
+            heuristic_profile=heuristic_profile,
             column_specs=column_specs,
         )
         diagnostics["issues"].extend(primary_issues)
@@ -1047,7 +1508,7 @@ class Phase1Pipeline:
             critic_sanitized, critic_issues = self._sanitize_llm_semantics_result(
                 parsed=parsed_critic,
                 table_name=table_name,
-                heuristic_table_role=heuristic_table_role,
+                heuristic_profile=heuristic_profile,
                 column_specs=column_specs,
             )
             diagnostics["issues"].extend(critic_issues)
@@ -1065,7 +1526,7 @@ class Phase1Pipeline:
         if self.config.llm_semantics_use_ensemble and ambiguity_score > max(2, int(0.2 * max(1, len(column_specs)))):
             alt_prompt = self._build_semantics_prompt(
                 table_name=table_name,
-                heuristic_table_role=heuristic_table_role,
+                heuristic_profile=heuristic_profile,
                 provided_time_col=provided_time_col,
                 column_specs=column_specs,
                 variant="alt",
@@ -1076,14 +1537,14 @@ class Phase1Pipeline:
                 alt_sanitized, alt_issues = self._sanitize_llm_semantics_result(
                     parsed=parsed_alt,
                     table_name=table_name,
-                    heuristic_table_role=heuristic_table_role,
+                    heuristic_profile=heuristic_profile,
                     column_specs=column_specs,
                 )
                 diagnostics["issues"].extend(alt_issues)
                 role_votes = [
-                    final_sanitized.get("table_role", heuristic_table_role),
-                    alt_sanitized.get("table_role", heuristic_table_role),
-                    heuristic_table_role,
+                    final_sanitized.get("table_role", heuristic_profile.get("table_role")),
+                    alt_sanitized.get("table_role", heuristic_profile.get("table_role")),
+                    heuristic_profile.get("table_role"),
                 ]
                 final_sanitized["table_role"] = max(set(role_votes), key=role_votes.count)
                 for spec in column_specs:
@@ -1102,6 +1563,19 @@ class Phase1Pipeline:
                     final_sanitized["columns"][column_name]["abstain"] = bool(
                         final_sanitized["columns"][column_name].get("abstain", False)
                     ) and bool(alt_sanitized["columns"][column_name].get("abstain", False))
+                for field in [
+                    "row_grain",
+                    "temporal_kind",
+                    "feature_time_columns",
+                    "primary_subject_entities",
+                    "signal_families",
+                    "anchor_strength",
+                    "history_value",
+                    "table_summary",
+                    "important_columns",
+                ]:
+                    if field not in final_sanitized and field in alt_sanitized:
+                        final_sanitized[field] = alt_sanitized[field]
 
         return final_sanitized, diagnostics
 
