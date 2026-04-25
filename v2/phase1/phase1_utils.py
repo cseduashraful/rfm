@@ -105,6 +105,40 @@ def singularize_identifier(name: str) -> str:
     return low
 
 
+def to_hashable_cell(value: Any) -> Any:
+    if isinstance(value, np.ndarray):
+        return ("__ndarray__", tuple(to_hashable_cell(v) for v in value.tolist()))
+    if isinstance(value, (list, tuple)):
+        return ("__seq__", tuple(to_hashable_cell(v) for v in value))
+    if isinstance(value, set):
+        items = sorted((to_hashable_cell(v) for v in value), key=lambda x: repr(x))
+        return ("__set__", tuple(items))
+    if isinstance(value, dict):
+        items = sorted(
+            ((str(k), to_hashable_cell(v)) for k, v in value.items()),
+            key=lambda x: x[0],
+        )
+        return ("__dict__", tuple(items))
+    try:
+        hash(value)
+        return value
+    except Exception:
+        return repr(value)
+
+
+def to_hashable_series(series: pd.Series) -> pd.Series:
+    return series.map(to_hashable_cell)
+
+
+def safe_nunique(series: pd.Series, dropna: bool = True) -> int:
+    try:
+        return int(series.nunique(dropna=dropna))
+    except TypeError:
+        clean = series.dropna() if dropna else series
+        hashed = to_hashable_series(clean)
+        return int(hashed.nunique(dropna=False))
+
+
 def safe_mode(series: pd.Series) -> Any:
     try:
         mode = series.mode(dropna=True)
@@ -117,7 +151,7 @@ def safe_mode(series: pd.Series) -> Any:
 
 def cramers_v(a: pd.Series, b: pd.Series) -> float | None:
     try:
-        contingency = pd.crosstab(a, b)
+        contingency = pd.crosstab(to_hashable_series(a), to_hashable_series(b))
         if contingency.empty:
             return None
         observed = contingency.to_numpy(dtype=float)
@@ -141,7 +175,7 @@ def cramers_v(a: pd.Series, b: pd.Series) -> float | None:
 
 def eta_squared(num: pd.Series, cat: pd.Series) -> float | None:
     try:
-        valid = pd.DataFrame({"num": num, "cat": cat}).dropna()
+        valid = pd.DataFrame({"num": num, "cat": to_hashable_series(cat)}).dropna()
         if valid.empty:
             return None
         grand_mean = valid["num"].mean()

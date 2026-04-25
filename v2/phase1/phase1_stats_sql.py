@@ -15,6 +15,7 @@ from phase1_utils import (
     is_numeric_dtype_name,
     is_text_dtype_name,
     quote_ident,
+    safe_nunique,
     safe_mode,
 )
 
@@ -360,7 +361,7 @@ def _build_correlations(
         pair = sample_df[[col_a, col_b]].dropna()
         if len(pair) < 50:
             continue
-        if pair[col_a].nunique(dropna=True) > 200 or pair[col_b].nunique(dropna=True) > 200:
+        if safe_nunique(pair[col_a], dropna=True) > 200 or safe_nunique(pair[col_b], dropna=True) > 200:
             continue
         score = cramers_v(pair[col_a], pair[col_b])
         if score is None:
@@ -383,7 +384,7 @@ def _build_correlations(
             pair = sample_df[[num_col, cat_col]].dropna()
             if len(pair) < 50:
                 continue
-            if pair[cat_col].nunique(dropna=True) > 200:
+            if safe_nunique(pair[cat_col], dropna=True) > 200:
                 continue
             score = eta_squared(pair[num_col], pair[cat_col])
             if score is None:
