@@ -27,4 +27,5 @@ fk_overlap_sample_size: 50000
 max_fk_null_ratio: 0.98
 max_cardinality_for_topk: 5000
 max_text_profile_rows: 5000
+cutoff_task_load_retries: 2
 strict_cutoff_task_loading: true

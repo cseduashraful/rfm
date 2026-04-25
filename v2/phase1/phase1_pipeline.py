@@ -5,6 +5,7 @@ import hashlib
 import json
 import re
 import sys
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -77,6 +78,7 @@ class Phase1Config:
     max_text_profile_rows: int = 5_000
     include_low_confidence_fks: bool = True
     strict_cutoff_task_loading: bool = True
+    cutoff_task_load_retries: int = 2
     max_composite_key_pairs: int = 20
 
 
@@ -177,7 +179,7 @@ class Phase1Pipeline:
         val_starts: list[tuple[str, pd.Timestamp]] = []
         for task_name in get_task_names(dataset):
             try:
-                task = get_task(dataset, task_name, download=True)
+                task = self._load_task_for_cutoff(dataset, task_name)
                 val_table = task.get_table("val", mask_input_cols=False)
                 time_col = getattr(task, "time_col", val_table.time_col)
                 if time_col is None or time_col not in val_table.df.columns:
@@ -222,6 +224,43 @@ class Phase1Pipeline:
             "warnings": warnings,
             "errors": errors,
         }
+
+    def _load_task_for_cutoff(self, dataset: str, task_name: str) -> Any:
+        retries = max(0, int(getattr(self.config, "cutoff_task_load_retries", 2)))
+        last_exc: Exception | None = None
+        for attempt in range(retries + 1):
+            try:
+                return get_task(dataset, task_name, download=True)
+            except Exception as exc:
+                last_exc = exc
+                message = str(exc)
+                retriable = self._is_retriable_task_load_error(message)
+                if (not retriable) or attempt >= retries:
+                    raise
+                wait_s = min(2.0, 0.5 * (attempt + 1))
+                print(
+                    f"[phase1][cutoff] retrying task load dataset={dataset} task={task_name} "
+                    f"attempt={attempt + 1}/{retries} after error: {message}"
+                )
+                time.sleep(wait_s)
+        if last_exc is not None:
+            raise last_exc
+        raise RuntimeError(f"Unexpected task load failure for dataset={dataset} task={task_name}")
+
+    def _is_retriable_task_load_error(self, message: str) -> bool:
+        low = str(message).lower()
+        retry_markers = [
+            "sha256 hash of downloaded file",
+            "downloaded file may have been corrupted",
+            "connection reset",
+            "connection aborted",
+            "temporarily unavailable",
+            "timed out",
+            "timeout",
+            "remote end closed connection",
+            "incomplete read",
+        ]
+        return any(marker in low for marker in retry_markers)
 
     def _build_fk_catalog(self, access: Phase1DataAccess) -> list[dict[str, Any]]:
         provided = score_provided_foreign_keys(access=access, config=self.config)
@@ -1312,6 +1351,11 @@ def build_arg_parser(defaults: dict[str, Any] | None = None) -> argparse.Argumen
     )
     parser.add_argument("--max-text-profile-rows", type=int, default=int(defaults.get("max_text_profile_rows", 5_000)))
     parser.add_argument(
+        "--cutoff-task-load-retries",
+        type=int,
+        default=int(defaults.get("cutoff_task_load_retries", 2)),
+    )
+    parser.add_argument(
         "--strict-cutoff-task-loading",
         action="store_true",
         default=bool(defaults.get("strict_cutoff_task_loading", True)),
@@ -1356,6 +1400,7 @@ def _build_config_from_args(args: argparse.Namespace) -> Phase1Config:
         max_fk_null_ratio=args.max_fk_null_ratio,
         max_cardinality_for_topk=args.max_cardinality_for_topk,
         max_text_profile_rows=args.max_text_profile_rows,
+        cutoff_task_load_retries=args.cutoff_task_load_retries,
         strict_cutoff_task_loading=bool(args.strict_cutoff_task_loading),
     )
 
