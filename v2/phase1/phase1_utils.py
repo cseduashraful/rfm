@@ -11,6 +11,10 @@ import pandas as pd
 
 ALLOWED_TABLE_ROLES = {"entity", "event", "lookup", "bridge", "static"}
 ALLOWED_COLUMN_ROLES = {"id", "timestamp", "measure", "status", "category", "text", "other"}
+NUMERIC_DTYPE_TOKENS = ("tinyint", "smallint", "integer", "bigint", "hugeint", "float", "double", "decimal")
+TEMPORAL_DTYPE_TOKENS = ("timestamp", "date", "time")
+TEXT_DTYPE_TOKENS = ("varchar", "string", "text")
+BOOLEAN_DTYPE_TOKENS = ("bool",)
 
 
 def json_default(value: Any) -> Any:
@@ -39,6 +43,66 @@ def write_json(path: Path, payload: dict[str, Any]) -> None:
 
 def is_numeric(series: pd.Series) -> bool:
     return pd.api.types.is_numeric_dtype(series)
+
+
+def is_numeric_dtype_name(dtype_name: str) -> bool:
+    low = str(dtype_name).lower()
+    return any(tok in low for tok in NUMERIC_DTYPE_TOKENS)
+
+
+def is_temporal_dtype_name(dtype_name: str) -> bool:
+    low = str(dtype_name).lower()
+    return any(tok in low for tok in TEMPORAL_DTYPE_TOKENS)
+
+
+def is_text_dtype_name(dtype_name: str) -> bool:
+    low = str(dtype_name).lower()
+    return any(tok in low for tok in TEXT_DTYPE_TOKENS)
+
+
+def is_boolean_dtype_name(dtype_name: str) -> bool:
+    low = str(dtype_name).lower()
+    return any(tok in low for tok in BOOLEAN_DTYPE_TOKENS)
+
+
+def quote_ident(name: str) -> str:
+    return '"' + str(name).replace('"', '""') + '"'
+
+
+def quote_qualified(schema: str, name: str) -> str:
+    return f"{quote_ident(schema)}.{quote_ident(name)}"
+
+
+def sql_str_literal(value: str) -> str:
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+def sql_timestamp_literal(value: Any) -> str:
+    ts = pd.Timestamp(value)
+    return f"TIMESTAMP {sql_str_literal(ts.isoformat())}"
+
+
+def normalize_identifier_tokens(name: str) -> set[str]:
+    low = "".join(ch if ch.isalnum() else " " for ch in str(name).lower()).strip()
+    toks = {tok for tok in low.split() if len(tok) >= 2}
+    expanded = set(toks)
+    for tok in list(toks):
+        if tok.endswith("s") and len(tok) > 3:
+            expanded.add(tok[:-1])
+        if tok.endswith("es") and len(tok) > 4:
+            expanded.add(tok[:-2])
+    return expanded
+
+
+def singularize_identifier(name: str) -> str:
+    low = str(name).lower()
+    if low.endswith("ies") and len(low) > 4:
+        return low[:-3] + "y"
+    if low.endswith("ses") and len(low) > 4:
+        return low[:-2]
+    if low.endswith("s") and len(low) > 3:
+        return low[:-1]
+    return low
 
 
 def safe_mode(series: pd.Series) -> Any:

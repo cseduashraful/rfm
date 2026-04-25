@@ -1,21 +1,15 @@
 from __future__ import annotations
 
 import argparse
-import concurrent.futures
-import itertools
+import hashlib
 import json
-import math
-import os
 import re
 import sys
-import time
-from collections import Counter
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any
 
-import numpy as np
 import pandas as pd
 
 # Ensure sibling project modules under RFM/code are importable when running from RFM/v2.
@@ -24,50 +18,23 @@ _RFM_CODE_DIR = _RFM_ROOT / "code"
 if _RFM_CODE_DIR.exists():
     sys.path.insert(0, str(_RFM_CODE_DIR))
 
-from train_data import maybe_materialize_dataset
 from relbench.tasks import get_task, get_task_names
 from zero_shot_llm import LocalLLM, MODEL_PATHS
+
+from phase1_data_access import Phase1DataAccess, TableMetadata
+from phase1_fk import infer_fk_candidates, score_provided_foreign_keys
+from phase1_semantic_graph import build_semantic_context_graph
+from phase1_stats_sql import build_table_stats
 from phase1_utils import (
     ALLOWED_COLUMN_ROLES,
     ALLOWED_TABLE_ROLES,
-    cramers_v as _cramers_v,
-    eta_squared as _eta_squared,
-    is_numeric as _is_numeric,
-    safe_mode as _safe_mode,
+    is_boolean_dtype_name,
+    is_numeric_dtype_name,
+    is_temporal_dtype_name,
+    is_text_dtype_name,
+    normalize_identifier_tokens,
     write_json as _write_json,
 )
-from phase1_fk import infer_fk_candidates
-from phase1_semantic_graph import build_semantic_context_graph
-
-
-def _to_hashable_cell(value: Any) -> Any:
-    if isinstance(value, np.ndarray):
-        return ("__ndarray__", tuple(_to_hashable_cell(v) for v in value.tolist()))
-    if isinstance(value, (list, tuple)):
-        return ("__seq__", tuple(_to_hashable_cell(v) for v in value))
-    if isinstance(value, set):
-        items = sorted((_to_hashable_cell(v) for v in value), key=lambda x: repr(x))
-        return ("__set__", tuple(items))
-    if isinstance(value, dict):
-        items = sorted(
-            ((str(k), _to_hashable_cell(v)) for k, v in value.items()),
-            key=lambda x: x[0],
-        )
-        return ("__dict__", tuple(items))
-    try:
-        hash(value)
-        return value
-    except Exception:
-        return repr(value)
-
-
-def _safe_nunique(series: pd.Series, dropna: bool = True) -> int:
-    try:
-        return int(series.nunique(dropna=dropna))
-    except TypeError:
-        clean = series.dropna() if dropna else series
-        hashed = clean.map(_to_hashable_cell)
-        return int(hashed.nunique(dropna=False))
 
 
 @dataclass
@@ -80,10 +47,11 @@ class Phase1Config:
     sample_size: int = 100_000
     correlation_topk_per_table: int = 30
     correlation_global_cap: int = 500
+    correlation_sample_size: int = 50_000
     histogram_bins: int = 20
     categorical_topk: int = 20
     random_seed: int = 42
-    artifact_version: str = "phase1.v1"
+    artifact_version: str = "phase1.v2"
     max_paths: int = 50_000
     max_frontier_per_start: int = 5_000
     skip_correlations: bool = False
@@ -97,6 +65,19 @@ class Phase1Config:
     compute_path_catalog: bool = False
     stats_workers: int = 1
     stats_checkpoint_resume: bool = True
+    max_rows_exact_profile: int = 200_000
+    max_corr_columns: int = 30
+    max_corr_numeric_columns: int = 20
+    max_corr_categorical_columns: int = 15
+    max_corr_cross_columns: int = 15
+    max_fk_pairs_exact: int = 250
+    fk_overlap_sample_size: int = 50_000
+    max_fk_null_ratio: float = 0.98
+    max_cardinality_for_topk: int = 5_000
+    max_text_profile_rows: int = 5_000
+    include_low_confidence_fks: bool = True
+    strict_cutoff_task_loading: bool = True
+    max_composite_key_pairs: int = 20
 
 
 class Phase1Pipeline:
@@ -105,58 +86,74 @@ class Phase1Pipeline:
         self._llm: LocalLLM | None = None
 
     def run(self) -> dict[str, Path]:
-        print("[phase1] loading dataset and computing global cutoff...")
-        db = maybe_materialize_dataset(
+        with Phase1DataAccess(
             dataset_name=self.config.dataset,
-            config={"dataset_download": True, "include_future_rows": False},
-            no_dataset_download=False,
-        )
-        cutoff = self._compute_global_val_start(self.config.dataset)
-        print(f"[phase1] global cutoff (val_start) = {cutoff}")
-        filtered_tables = self._build_cutoff_filtered_tables(db, cutoff)
+            random_seed=self.config.random_seed,
+            download=True,
+        ) as access:
+            print("[phase1] computing global cutoff...")
+            cutoff_info = self._compute_global_val_start(self.config.dataset)
+            cutoff = pd.Timestamp(cutoff_info["cutoff"])
+            access.set_cutoff(cutoff)
+            print(f"[phase1] global cutoff (val_start) = {cutoff}")
 
-        print("[phase1] building schema artifact...")
-        schema = self._build_schema_artifact(db, filtered_tables, cutoff)
-        print("[phase1] building stats artifact...")
-        stats = self._build_stats_artifact(db, filtered_tables, cutoff)
-        print("[phase1] building semantics artifact...")
-        semantics = self._build_semantics_artifact(db, filtered_tables, cutoff)
-        print("[phase1] building semantic context graph artifact...")
-        semantic_context_graph = self._build_semantic_context_graph_artifact(
-            db=db,
-            filtered=filtered_tables,
-            cutoff=cutoff,
-            schema_artifact=schema,
-            stats_artifact=stats,
-            semantics_artifact=semantics,
-        )
-        path_catalog: dict[str, Any] | None = None
-        if self.config.compute_path_catalog:
-            print("[phase1] building path catalog artifact...")
-            path_catalog = self._build_path_catalog_artifact(db, filtered_tables, cutoff)
-        else:
-            print("[phase1] skipping path catalog artifact (enable with --compute-path-catalog).")
-        print("[phase1] building safety artifact...")
-        safety = self._build_safety_artifact(cutoff)
+            print("[phase1] scoring provided/inferred foreign keys...")
+            fk_catalog = self._build_fk_catalog(access)
 
-        base = self.config.output_dir / self.config.dataset
-        paths = {
-            "schema": base / "schema.json",
-            "stats": base / "stats.json",
-            "semantics": base / "semantics.json",
-            "semantic_context_graph": base / "semantic_context_graph.json",
-            "safety_rules": base / "safety_rules.json",
-        }
-        if self.config.compute_path_catalog:
-            paths["path_catalog"] = base / "path_catalog.json"
-        _write_json(paths["schema"], schema)
-        _write_json(paths["stats"], stats)
-        _write_json(paths["semantics"], semantics)
-        _write_json(paths["semantic_context_graph"], semantic_context_graph)
-        if self.config.compute_path_catalog and path_catalog is not None:
-            _write_json(paths["path_catalog"], path_catalog)
-        _write_json(paths["safety_rules"], safety)
-        return paths
+            print("[phase1] building stats artifact...")
+            stats = self._build_stats_artifact(access, cutoff)
+
+            print("[phase1] building schema artifact...")
+            schema = self._build_schema_artifact(access, stats, cutoff, fk_catalog)
+
+            print("[phase1] building semantics artifact...")
+            semantics = self._build_semantics_artifact(schema, stats, cutoff)
+
+            print("[phase1] building semantic context graph artifact...")
+            semantic_context_graph = self._build_semantic_context_graph_artifact(
+                cutoff=cutoff,
+                schema_artifact=schema,
+                stats_artifact=stats,
+                semantics_artifact=semantics,
+                fk_catalog=fk_catalog,
+            )
+
+            path_catalog: dict[str, Any] | None = None
+            if self.config.compute_path_catalog:
+                print("[phase1] building lightweight path catalog placeholder...")
+                path_catalog = self._build_path_catalog_artifact(cutoff, fk_catalog)
+            else:
+                print("[phase1] skipping path catalog artifact.")
+
+            print("[phase1] building safety artifact...")
+            safety = self._build_safety_artifact(
+                cutoff=cutoff,
+                access=access,
+                cutoff_info=cutoff_info,
+                schema_artifact=schema,
+                stats_artifact=stats,
+                semantics_artifact=semantics,
+                fk_catalog=fk_catalog,
+            )
+
+            base = self.config.output_dir / self.config.dataset
+            paths = {
+                "schema": base / "schema.json",
+                "stats": base / "stats.json",
+                "semantics": base / "semantics.json",
+                "semantic_context_graph": base / "semantic_context_graph.json",
+                "safety_rules": base / "safety_rules.json",
+            }
+            if self.config.compute_path_catalog:
+                paths["path_catalog"] = base / "path_catalog.json"
+            _write_json(paths["schema"], schema)
+            _write_json(paths["stats"], stats)
+            _write_json(paths["semantics"], semantics)
+            _write_json(paths["semantic_context_graph"], semantic_context_graph)
+            if self.config.compute_path_catalog and path_catalog is not None:
+                _write_json(paths["path_catalog"], path_catalog)
+            _write_json(paths["safety_rules"], safety)
+            return paths
 
     def _get_llm(self) -> LocalLLM:
         if self._llm is None:
@@ -173,318 +170,100 @@ class Phase1Pipeline:
             "global_cutoff_time": cutoff,
         }
 
-    def _compute_global_val_start(self, dataset: str) -> pd.Timestamp:
-        val_starts: list[pd.Timestamp] = []
+    def _compute_global_val_start(self, dataset: str) -> dict[str, Any]:
+        task_reports: list[dict[str, Any]] = []
+        errors: list[str] = []
+        warnings: list[str] = []
+        val_starts: list[tuple[str, pd.Timestamp]] = []
         for task_name in get_task_names(dataset):
             try:
                 task = get_task(dataset, task_name, download=True)
                 val_table = task.get_table("val", mask_input_cols=False)
                 time_col = getattr(task, "time_col", val_table.time_col)
                 if time_col is None or time_col not in val_table.df.columns:
+                    warnings.append(f"task={task_name}: missing validation time column")
+                    task_reports.append(
+                        {"task_name": task_name, "status": "missing_time_column", "time_col": time_col}
+                    )
                     continue
                 ts = pd.to_datetime(val_table.df[time_col], errors="coerce").dropna()
-                if not ts.empty:
-                    val_starts.append(pd.Timestamp(ts.min()))
-            except Exception:
-                continue
-        if not val_starts:
-            raise RuntimeError(
-                f"Could not determine global val_start cutoff for dataset={dataset}."
-            )
-        return min(val_starts)
-
-    def _build_cutoff_filtered_tables(
-        self,
-        db: Any,
-        cutoff: pd.Timestamp,
-    ) -> dict[str, pd.DataFrame]:
-        filtered: dict[str, pd.DataFrame] = {}
-        for table_name, table in db.table_dict.items():
-            frame = table.df
-            time_col = table.time_col
-            if time_col is not None and time_col in frame.columns:
-                ts = pd.to_datetime(frame[time_col], errors="coerce")
-                mask = ts.notna() & (ts < cutoff)
-                frame = frame.loc[mask]
-            filtered[table_name] = frame
-        return filtered
-
-    def _infer_pk_candidates(self, frame: pd.DataFrame, table_name: str) -> list[dict[str, Any]]:
-        candidates: list[dict[str, Any]] = []
-        n = len(frame)
-        if n == 0:
-            return candidates
-        for col in frame.columns:
-            non_null = frame[col].notna().sum()
-            unique = _safe_nunique(frame[col], dropna=True)
-            if unique == n and non_null == n:
-                candidates.append({
-                    "columns": [col],
-                    "confidence": "high",
-                    "reason": "unique_and_non_null",
-                })
-            elif unique >= int(0.995 * n) and non_null >= int(0.995 * n):
-                candidates.append({
-                    "columns": [col],
-                    "confidence": "medium",
-                    "reason": "near_unique",
-                })
-        id_like = [c for c in frame.columns if c.lower().endswith("id")]
-        for c1, c2 in itertools.combinations(id_like[:12], 2):
-            combo = frame[[c1, c2]].dropna()
-            if combo.empty:
-                continue
-            unique = len(combo.drop_duplicates())
-            if unique == len(combo) and len(combo) >= int(0.95 * n):
-                candidates.append({
-                    "columns": [c1, c2],
-                    "confidence": "medium",
-                    "reason": "composite_unique",
-                })
-        return candidates
-
-    def _infer_fk_candidates(self, db: Any, filtered: dict[str, pd.DataFrame]) -> list[dict[str, Any]]:
-        return infer_fk_candidates(db, filtered)
-
-    def _build_schema_artifact(self, db: Any, filtered: dict[str, pd.DataFrame], cutoff: pd.Timestamp) -> dict[str, Any]:
-        header = self._artifact_header(cutoff)
-        inferred_fk = self._infer_fk_candidates(db, filtered)
-        tables = []
-        for table_name, table in db.table_dict.items():
-            frame = filtered[table_name]
-            cols = []
-            for col in frame.columns:
-                cols.append(
-                    {
-                        "name": col,
-                        "dtype": str(frame[col].dtype),
-                        "nullable": bool(frame[col].isna().any()),
-                        "n_unique": _safe_nunique(frame[col], dropna=True),
-                    }
-                )
-            tables.append(
-                {
-                    "table_name": table_name,
-                    "row_count": int(len(frame)),
-                    "provided_primary_key": table.pkey_col,
-                    "provided_foreign_keys": dict(table.fkey_col_to_pkey_table),
-                    "time_column": table.time_col,
-                    "columns": cols,
-                    "inferred_pk_candidates": self._infer_pk_candidates(frame, table_name),
-                }
-            )
-        return {
-            **header,
-            "tables": tables,
-            "inferred_foreign_key_candidates": inferred_fk,
-        }
-
-    def _sample_if_needed(self, frame: pd.DataFrame) -> tuple[pd.DataFrame, bool]:
-        if (not self.config.sampling_enabled) or len(frame) <= self.config.sampling_row_threshold:
-            return frame, False
-        sample_n = min(self.config.sample_size, len(frame))
-        sampled = frame.sample(n=sample_n, random_state=self.config.random_seed)
-        return sampled, True
-
-    def _numeric_stats(self, series: pd.Series) -> dict[str, Any]:
-        clean = pd.to_numeric(series, errors="coerce").dropna()
-        if clean.empty:
-            return {}
-        q = clean.quantile([0.1, 0.25, 0.5, 0.75, 0.9])
-        hist_counts, hist_edges = np.histogram(clean.to_numpy(), bins=self.config.histogram_bins)
-        return {
-            "min": float(clean.min()),
-            "max": float(clean.max()),
-            "mean": float(clean.mean()),
-            "std": float(clean.std(ddof=1)) if len(clean) > 1 else 0.0,
-            "median": float(clean.median()),
-            "mode": _safe_mode(clean),
-            "quantiles": {
-                "p10": float(q.loc[0.1]),
-                "p25": float(q.loc[0.25]),
-                "p50": float(q.loc[0.5]),
-                "p75": float(q.loc[0.75]),
-                "p90": float(q.loc[0.9]),
-            },
-            "histogram": {
-                "counts": hist_counts.tolist(),
-                "bin_edges": hist_edges.tolist(),
-            },
-        }
-
-    def _categorical_stats(self, series: pd.Series) -> dict[str, Any]:
-        clean = series.dropna()
-        if clean.empty:
-            return {}
-        vc = clean.value_counts(dropna=True).head(self.config.categorical_topk)
-        return {
-            "cardinality": _safe_nunique(clean, dropna=True),
-            "mode": _safe_mode(clean),
-            "top_values": [{"value": str(idx), "count": int(val)} for idx, val in vc.items()],
-        }
-
-    def _table_temporal_coverage(self, frame: pd.DataFrame, time_col: str | None) -> dict[str, Any]:
-        if time_col is None or time_col not in frame.columns:
-            return {"is_static": True}
-        ts = pd.to_datetime(frame[time_col], errors="coerce").dropna()
-        if ts.empty:
-            return {"is_static": False, "empty": True}
-        monthly = ts.dt.to_period("M").astype(str).value_counts().sort_index()
-        return {
-            "is_static": False,
-            "min_time": pd.Timestamp(ts.min()),
-            "max_time": pd.Timestamp(ts.max()),
-            "coverage_by_month": {k: int(v) for k, v in monthly.items()},
-        }
-
-    def _build_correlations_for_table(
-        self,
-        sampled_df: pd.DataFrame,
-        table_name: str,
-        *,
-        sampled: bool,
-    ) -> list[dict[str, Any]]:
-        if self.config.skip_correlations:
-            return []
-        correlations: list[dict[str, Any]] = []
-
-        numeric_cols = [c for c in sampled_df.columns if _is_numeric(sampled_df[c])]
-        cat_cols = [c for c in sampled_df.columns if not _is_numeric(sampled_df[c])]
-
-        # Vectorized Spearman for numeric pairs to avoid many pairwise dropna scans.
-        num_subset = numeric_cols[:40]
-        if len(num_subset) >= 2:
-            num_df = sampled_df[num_subset].apply(pd.to_numeric, errors="coerce")
-            corr_mat = num_df.corr(method="spearman", min_periods=30)
-            notna = num_df.notna().astype(np.int8)
-            valid_counts = notna.T.dot(notna)
-            for i, a in enumerate(num_subset):
-                for j in range(i + 1, len(num_subset)):
-                    b = num_subset[j]
-                    val = corr_mat.loc[a, b]
-                    if pd.isna(val):
-                        continue
-                    sample_size = int(valid_counts.loc[a, b])
-                    if sample_size < 30:
-                        continue
-                    correlations.append(
-                        {
-                            "type": "numeric_numeric_spearman",
-                            "table": table_name,
-                            "col_a": a,
-                            "col_b": b,
-                            "score": float(val),
-                            "sampled": sampled,
-                            "sample_size": sample_size,
-                        }
+                if ts.empty:
+                    warnings.append(f"task={task_name}: empty validation timestamps")
+                    task_reports.append(
+                        {"task_name": task_name, "status": "empty_validation_timestamps", "time_col": time_col}
                     )
-
-        for a, b in itertools.combinations(cat_cols[:25], 2):
-            pair = sampled_df[[a, b]].dropna()
-            if len(pair) < 50:
-                continue
-            if _safe_nunique(pair[a], dropna=True) > 200 or _safe_nunique(pair[b], dropna=True) > 200:
-                continue
-            val = _cramers_v(pair[a], pair[b])
-            if val is None:
-                continue
-            correlations.append(
-                {
-                    "type": "categorical_categorical_cramers_v",
-                    "table": table_name,
-                    "col_a": a,
-                    "col_b": b,
-                    "score": float(val),
-                    "sampled": sampled,
-                    "sample_size": int(len(pair)),
-                }
-            )
-
-        for num_col in numeric_cols[:20]:
-            for cat_col in cat_cols[:20]:
-                pair = sampled_df[[num_col, cat_col]].dropna()
-                if len(pair) < 50:
                     continue
-                if _safe_nunique(pair[cat_col], dropna=True) > 200:
-                    continue
-                val = _eta_squared(pair[num_col], pair[cat_col])
-                if val is None:
-                    continue
-                correlations.append(
+                val_start = pd.Timestamp(ts.min())
+                val_starts.append((task_name, val_start))
+                task_reports.append(
                     {
-                        "type": "numeric_categorical_eta_squared",
-                        "table": table_name,
-                        "col_a": num_col,
-                        "col_b": cat_col,
-                        "score": float(val),
-                        "sampled": sampled,
-                        "sample_size": int(len(pair)),
+                        "task_name": task_name,
+                        "status": "ok",
+                        "time_col": time_col,
+                        "val_start": val_start,
                     }
                 )
-
-        correlations.sort(key=lambda x: abs(float(x["score"])), reverse=True)
-        return correlations[: self.config.correlation_topk_per_table]
-
-    def _build_stats_for_single_table(
-        self,
-        table_name: str,
-        table: Any,
-        frame: pd.DataFrame,
-    ) -> tuple[dict[str, Any], float]:
-        t0 = time.perf_counter()
-        sampled_frame, sampled = self._sample_if_needed(frame)
-        col_stats: dict[str, Any] = {}
-
-        if len(frame):
-            missingness_by_col = frame.isna().mean()
-            non_null_by_col = frame.notna().sum()
-        else:
-            missingness_by_col = pd.Series(index=frame.columns, dtype=float)
-            non_null_by_col = pd.Series(index=frame.columns, dtype=float)
-
-        for col in frame.columns:
-            full_col = frame[col]
-            prof_col = sampled_frame[col] if col in sampled_frame.columns else full_col
-            base = {
-                "missingness": float(missingness_by_col.get(col, 0.0)) if len(full_col) else None,
-                "non_null_count": int(non_null_by_col.get(col, 0)),
-                "sampled": sampled,
-                "profile_sample_size": int(len(prof_col)),
-            }
-            if _is_numeric(full_col):
-                base["numeric"] = self._numeric_stats(prof_col)
-            else:
-                base["categorical"] = self._categorical_stats(prof_col)
-            col_stats[col] = base
-
-        table_corrs = self._build_correlations_for_table(
-            sampled_df=sampled_frame,
-            table_name=table_name,
-            sampled=sampled,
-        )
-        table_payload = {
-            "table_name": table_name,
-            "row_count": int(len(frame)),
-            "sampled": sampled,
-            "temporal_coverage": self._table_temporal_coverage(frame, table.time_col),
-            "columns": col_stats,
-            "correlations": table_corrs,
+            except Exception as exc:
+                msg = f"task={task_name}: {exc}"
+                errors.append(msg)
+                task_reports.append({"task_name": task_name, "status": "error", "error": str(exc)})
+        if errors and self.config.strict_cutoff_task_loading:
+            raise RuntimeError(
+                "Failed to compute cutoff because one or more task validation tables could not be loaded: "
+                + "; ".join(errors[:10])
+            )
+        if not val_starts:
+            raise RuntimeError(f"Could not determine global val_start cutoff for dataset={dataset}.")
+        selected_task, cutoff = min(val_starts, key=lambda item: item[1])
+        return {
+            "cutoff": cutoff,
+            "selected_from_task": selected_task,
+            "task_reports": task_reports,
+            "warnings": warnings,
+            "errors": errors,
         }
-        elapsed = time.perf_counter() - t0
-        return table_payload, elapsed
 
-    def _build_stats_artifact(self, db: Any, filtered: dict[str, pd.DataFrame], cutoff: pd.Timestamp) -> dict[str, Any]:
-        header = self._artifact_header(cutoff)
-        table_order = list(db.table_dict.keys())
-        total_tables = len(table_order)
-        tables_by_name: dict[str, dict[str, Any]] = {}
-        all_corrs: list[dict[str, Any]] = []
-        stats_dir = self.config.output_dir / self.config.dataset
-        stats_dir.mkdir(parents=True, exist_ok=True)
-        ckpt_tables_path = stats_dir / "stats_tables_checkpoint.ndjson"
-        ckpt_meta_path = stats_dir / "stats_checkpoint_meta.json"
-        ckpt_progress_path = stats_dir / "stats_progress.json"
-        ckpt_signature = {
+    def _build_fk_catalog(self, access: Phase1DataAccess) -> list[dict[str, Any]]:
+        provided = score_provided_foreign_keys(access=access, config=self.config)
+        inferred = infer_fk_candidates(access=access, config=self.config)
+        by_key: dict[tuple[str, str, str, str], dict[str, Any]] = {}
+        for candidate in provided + inferred:
+            key = (
+                str(candidate.get("child_table", "")),
+                str(candidate.get("child_column", "")),
+                str(candidate.get("parent_table", "")),
+                str(candidate.get("parent_column", "")),
+            )
+            if not all(key):
+                continue
+            existing = by_key.get(key)
+            if existing is None:
+                by_key[key] = candidate
+                continue
+            if str(candidate.get("source", "")) == "provided":
+                by_key[key] = candidate
+                continue
+            if float(candidate.get("overlap_ratio", 0.0)) > float(existing.get("overlap_ratio", 0.0)):
+                by_key[key] = candidate
+        return sorted(
+            by_key.values(),
+            key=lambda row: (
+                str(row.get("source", "")) != "provided",
+                -float(row.get("overlap_ratio", 0.0)),
+                str(row.get("child_table", "")),
+                str(row.get("child_column", "")),
+            ),
+        )
+
+    def _stats_checkpoint_signature(
+        self,
+        *,
+        access: Phase1DataAccess,
+        cutoff: pd.Timestamp,
+    ) -> dict[str, Any]:
+        manifest_json = json.dumps(access.dataset_manifest(), sort_keys=True, default=str)
+        manifest_hash = hashlib.sha256(manifest_json.encode("utf-8")).hexdigest()
+        return {
             "artifact_version": self.config.artifact_version,
             "dataset_name": self.config.dataset,
             "global_cutoff_time": str(cutoff),
@@ -492,10 +271,35 @@ class Phase1Pipeline:
             "sampling_row_threshold": int(self.config.sampling_row_threshold),
             "sample_size": int(self.config.sample_size),
             "correlation_topk_per_table": int(self.config.correlation_topk_per_table),
+            "correlation_global_cap": int(self.config.correlation_global_cap),
             "skip_correlations": bool(self.config.skip_correlations),
             "histogram_bins": int(self.config.histogram_bins),
             "categorical_topk": int(self.config.categorical_topk),
+            "max_rows_exact_profile": int(self.config.max_rows_exact_profile),
+            "max_corr_columns": int(self.config.max_corr_columns),
+            "max_fk_pairs_exact": int(self.config.max_fk_pairs_exact),
+            "max_cardinality_for_topk": int(self.config.max_cardinality_for_topk),
+            "random_seed": int(self.config.random_seed),
+            "manifest_hash": manifest_hash,
         }
+
+    def _build_stats_artifact(
+        self,
+        access: Phase1DataAccess,
+        cutoff: pd.Timestamp,
+    ) -> dict[str, Any]:
+        header = self._artifact_header(cutoff)
+        table_order = list(access.table_names)
+        total_tables = len(table_order)
+        tables_by_name: dict[str, dict[str, Any]] = {}
+        all_corrs: list[dict[str, Any]] = []
+
+        stats_dir = self.config.output_dir / self.config.dataset
+        stats_dir.mkdir(parents=True, exist_ok=True)
+        ckpt_tables_path = stats_dir / "stats_tables_checkpoint.ndjson"
+        ckpt_meta_path = stats_dir / "stats_checkpoint_meta.json"
+        ckpt_progress_path = stats_dir / "stats_progress.json"
+        signature = self._stats_checkpoint_signature(access=access, cutoff=cutoff)
 
         resume_enabled = bool(self.config.stats_checkpoint_resume)
         if resume_enabled and ckpt_meta_path.exists() and ckpt_tables_path.exists():
@@ -503,9 +307,9 @@ class Phase1Pipeline:
                 existing_meta = json.loads(ckpt_meta_path.read_text(encoding="utf-8"))
             except Exception:
                 existing_meta = {}
-            if existing_meta == ckpt_signature:
-                with ckpt_tables_path.open("r", encoding="utf-8") as f:
-                    for line in f:
+            if existing_meta == signature:
+                with ckpt_tables_path.open("r", encoding="utf-8") as handle:
+                    for line in handle:
                         line = line.strip()
                         if not line:
                             continue
@@ -513,9 +317,9 @@ class Phase1Pipeline:
                             payload = json.loads(line)
                         except Exception:
                             continue
-                        tname = str(payload.get("table_name", ""))
-                        if tname and tname in db.table_dict:
-                            tables_by_name[tname] = payload
+                        table_name = str(payload.get("table_name", ""))
+                        if table_name in access.table_names:
+                            tables_by_name[table_name] = payload
                 if tables_by_name:
                     print(
                         f"[phase1][stats] resumed {len(tables_by_name)}/{total_tables} tables from checkpoint."
@@ -527,123 +331,333 @@ class Phase1Pipeline:
             ckpt_tables_path.unlink(missing_ok=True)
             ckpt_progress_path.unlink(missing_ok=True)
 
-        ckpt_meta_path.write_text(json.dumps(ckpt_signature, indent=2), encoding="utf-8")
-
+        ckpt_meta_path.write_text(json.dumps(signature, indent=2), encoding="utf-8")
         for resumed in tables_by_name.values():
             all_corrs.extend(resumed.get("correlations", []))
 
-        pending_tables = [t for t in table_order if t not in tables_by_name]
-        max_workers = max(1, int(self.config.stats_workers))
-        print(
-            f"[phase1][stats] computing {len(pending_tables)} pending tables "
-            f"(workers={max_workers})."
-        )
+        pending_tables = [name for name in table_order if name not in tables_by_name]
+        print(f"[phase1][stats] computing {len(pending_tables)} pending tables.")
+        for table_name in pending_tables:
+            table_payload, elapsed = build_table_stats(
+                access=access,
+                table_meta=access.table_meta(table_name),
+                config=self.config,
+            )
+            tables_by_name[table_name] = table_payload
+            all_corrs.extend(table_payload.get("correlations", []))
+            with ckpt_tables_path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(table_payload, default=str))
+                handle.write("\n")
+            _write_json(
+                ckpt_progress_path,
+                {
+                    "dataset_name": self.config.dataset,
+                    "global_cutoff_time": str(cutoff),
+                    "completed_tables": len(tables_by_name),
+                    "total_tables": total_tables,
+                    "last_table_name": table_name,
+                    "last_table_elapsed_sec": float(elapsed),
+                    "updated_at_utc": datetime.now(timezone.utc).isoformat(),
+                },
+            )
+            print(
+                f"[phase1][stats] {len(tables_by_name)}/{total_tables} "
+                f"table={table_name} done in {elapsed:.2f}s"
+            )
 
-        def _record_checkpoint(table_payload: dict[str, Any], elapsed_sec: float) -> None:
-            with ckpt_tables_path.open("a", encoding="utf-8") as f:
-                f.write(json.dumps(table_payload, default=str))
-                f.write("\n")
-            completed = len(tables_by_name)
-            progress_payload = {
-                "dataset_name": self.config.dataset,
-                "global_cutoff_time": str(cutoff),
-                "completed_tables": completed,
-                "total_tables": total_tables,
-                "last_table_name": table_payload.get("table_name"),
-                "last_table_elapsed_sec": float(elapsed_sec),
-                "updated_at_utc": datetime.now(timezone.utc).isoformat(),
-            }
-            _write_json(ckpt_progress_path, progress_payload)
+        tables = [tables_by_name[name] for name in table_order if name in tables_by_name]
+        all_corrs.sort(key=lambda row: abs(float(row["score"])), reverse=True)
+        mode_counts = {
+            "exact": sum(1 for table in tables if table.get("profiling_mode") == "exact"),
+            "sampled": sum(1 for table in tables if table.get("profiling_mode") == "sampled"),
+            "approx": sum(1 for table in tables if table.get("profiling_mode") == "approx"),
+            "skipped": sum(1 for table in tables if table.get("profiling_mode") == "skipped"),
+        }
+        return {
+            **header,
+            "profiling_summary": {
+                "mode_counts": mode_counts,
+                "checkpoint_resume_enabled": bool(self.config.stats_checkpoint_resume),
+                "sampling_enabled": bool(self.config.sampling_enabled),
+                "sample_size": int(self.config.sample_size),
+                "max_rows_exact_profile": int(self.config.max_rows_exact_profile),
+            },
+            "tables": tables,
+            "global_top_correlations": all_corrs[: self.config.correlation_global_cap],
+        }
 
-        if pending_tables:
-            if max_workers == 1:
-                for idx, table_name in enumerate(pending_tables, start=1):
-                    table_payload, elapsed = self._build_stats_for_single_table(
-                        table_name=table_name,
-                        table=db.table_dict[table_name],
-                        frame=filtered[table_name],
-                    )
-                    tables_by_name[table_name] = table_payload
-                    all_corrs.extend(table_payload.get("correlations", []))
-                    _record_checkpoint(table_payload, elapsed)
-                    print(
-                        f"[phase1][stats] {len(tables_by_name)}/{total_tables} "
-                        f"table={table_name} done in {elapsed:.2f}s"
-                    )
-            else:
-                with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-                    future_map = {
-                        executor.submit(
-                            self._build_stats_for_single_table,
-                            table_name,
-                            db.table_dict[table_name],
-                            filtered[table_name],
-                        ): table_name
-                        for table_name in pending_tables
+    def _infer_pk_candidates(
+        self,
+        access: Phase1DataAccess,
+        table_meta: TableMetadata,
+        stats_table: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        candidates: list[dict[str, Any]] = []
+        row_count = int(stats_table.get("row_count", 0))
+        if row_count <= 0:
+            return candidates
+        columns_stats = stats_table.get("columns", {})
+        for column_name in table_meta.columns:
+            meta = columns_stats.get(column_name, {})
+            distinct_count = meta.get("distinct_count")
+            missingness = meta.get("missingness")
+            non_null_count = int(meta.get("non_null_count", 0) or 0)
+            if distinct_count is None:
+                continue
+            if int(distinct_count) == row_count and non_null_count == row_count:
+                candidates.append(
+                    {
+                        "columns": [column_name],
+                        "confidence": "high",
+                        "reason": "unique_and_non_null",
                     }
-                    for future in concurrent.futures.as_completed(future_map):
-                        table_name = future_map[future]
-                        table_payload, elapsed = future.result()
-                        tables_by_name[table_name] = table_payload
-                        all_corrs.extend(table_payload.get("correlations", []))
-                        _record_checkpoint(table_payload, elapsed)
-                        print(
-                            f"[phase1][stats] {len(tables_by_name)}/{total_tables} "
-                            f"table={table_name} done in {elapsed:.2f}s"
-                        )
+                )
+            elif int(distinct_count) >= int(0.995 * row_count) and missingness is not None and float(missingness) <= 0.005:
+                candidates.append(
+                    {
+                        "columns": [column_name],
+                        "confidence": "medium",
+                        "reason": "near_unique",
+                    }
+                )
 
-        tables = [tables_by_name[t] for t in table_order if t in tables_by_name]
+        id_like = [col for col in table_meta.columns if col.lower().endswith("id")]
+        relation_sql = access.relation_sql(table_meta.table_name, filtered=True)
+        if row_count > self.config.max_rows_exact_profile:
+            relation_sql = access.sampled_relation_sql(
+                table_meta.table_name,
+                filtered=True,
+                sample_size=min(self.config.sample_size, row_count),
+                columns=id_like[:12],
+            )
+        pairs_checked = 0
+        for idx, col_a in enumerate(id_like[:12]):
+            for col_b in id_like[idx + 1 : 12]:
+                if pairs_checked >= self.config.max_composite_key_pairs:
+                    break
+                pairs_checked += 1
+                qcol_a = f'"{col_a}"'
+                qcol_b = f'"{col_b}"'
+                try:
+                    row = access.fetchdf(
+                        f"WITH valid AS ("
+                        f"  SELECT {qcol_a} AS col_a, {qcol_b} AS col_b FROM ({relation_sql}) rel "
+                        f"  WHERE {qcol_a} IS NOT NULL AND {qcol_b} IS NOT NULL"
+                        f"), counts AS ("
+                        f"  SELECT COUNT(*) AS non_null_rows FROM valid"
+                        f"), distinct_pairs AS ("
+                        f"  SELECT COUNT(*) AS distinct_rows FROM (SELECT DISTINCT col_a, col_b FROM valid)"
+                        f") "
+                        "SELECT non_null_rows, distinct_rows FROM counts CROSS JOIN distinct_pairs"
+                    )
+                except Exception:
+                    continue
+                if row.empty:
+                    continue
+                non_null_rows = int(row.iloc[0].get("non_null_rows", 0) or 0)
+                distinct_rows = int(row.iloc[0].get("distinct_rows", 0) or 0)
+                if non_null_rows <= 0:
+                    continue
+                coverage = float(non_null_rows / row_count)
+                if distinct_rows == non_null_rows and coverage >= 0.95:
+                    candidates.append(
+                        {
+                            "columns": [col_a, col_b],
+                            "confidence": "medium",
+                            "reason": "composite_unique",
+                        }
+                    )
+        return candidates
 
-        all_corrs.sort(key=lambda x: abs(float(x["score"])), reverse=True)
-        all_corrs = all_corrs[: self.config.correlation_global_cap]
-
+    def _build_schema_artifact(
+        self,
+        access: Phase1DataAccess,
+        stats_artifact: dict[str, Any],
+        cutoff: pd.Timestamp,
+        fk_catalog: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        header = self._artifact_header(cutoff)
+        stats_by_table = {
+            str(table.get("table_name", "")): table
+            for table in stats_artifact.get("tables", [])
+        }
+        tables: list[dict[str, Any]] = []
+        for table_name in access.table_names:
+            table_meta = access.table_meta(table_name)
+            stats_table = stats_by_table.get(table_name, {})
+            columns = []
+            for column_name in table_meta.columns:
+                stats_col = (stats_table.get("columns", {}) or {}).get(column_name, {})
+                columns.append(
+                    {
+                        "name": column_name,
+                        "dtype": table_meta.dtypes.get(column_name, ""),
+                        "nullable": bool((stats_col.get("missingness") or 0.0) > 0.0),
+                        "n_unique": stats_col.get("distinct_count"),
+                        "n_unique_method": stats_col.get("distinct_count_method"),
+                    }
+                )
+            tables.append(
+                {
+                    "table_name": table_name,
+                    "row_count": int(stats_table.get("row_count", 0)),
+                    "rows_before_cutoff_filter": int(stats_table.get("rows_before_cutoff_filter", 0)),
+                    "rows_after_cutoff_filter": int(stats_table.get("rows_after_cutoff_filter", 0)),
+                    "rows_dropped_invalid_time": int(stats_table.get("rows_dropped_invalid_time", 0)),
+                    "provided_primary_key": table_meta.provided_primary_key,
+                    "provided_foreign_keys": dict(table_meta.provided_foreign_keys),
+                    "time_column": table_meta.time_column,
+                    "detected_time_columns": list(table_meta.detected_time_columns),
+                    "metadata_source": table_meta.metadata_source,
+                    "metadata_warnings": list(table_meta.metadata_warnings),
+                    "columns": columns,
+                    "inferred_pk_candidates": self._infer_pk_candidates(access, table_meta, stats_table),
+                }
+            )
         return {
             **header,
             "tables": tables,
-            "global_top_correlations": all_corrs,
+            "provided_foreign_key_candidates": [fk for fk in fk_catalog if fk.get("source") == "provided"],
+            "inferred_foreign_key_candidates": [fk for fk in fk_catalog if fk.get("source") != "provided"],
+            "foreign_key_catalog": fk_catalog,
         }
 
-    def _table_role(self, table_name: str, table_obj: Any) -> str:
+    def _table_role(
+        self,
+        table_name: str,
+        schema_table: dict[str, Any],
+        stats_table: dict[str, Any],
+    ) -> str:
         lower = table_name.lower()
-        if table_obj.time_col is None:
+        time_column = schema_table.get("time_column")
+        provided_fks = schema_table.get("provided_foreign_keys", {}) or {}
+        columns = schema_table.get("columns", [])
+        row_count = int(stats_table.get("row_count", schema_table.get("row_count", 0)) or 0)
+        if time_column is None:
+            if len(provided_fks) >= 2 and len(columns) <= len(provided_fks) + 4:
+                return "bridge"
             return "static"
-        if lower.endswith("s") and lower not in {"status", "news"}:
+        if any(tok in lower for tok in {"event", "log", "history", "fact", "transaction"}) or lower.endswith("s"):
             return "event"
+        if len(provided_fks) >= 2 and len(columns) <= len(provided_fks) + 5:
+            return "bridge"
+        low_card_cols = 0
+        for column_name, column_meta in (stats_table.get("columns", {}) or {}).items():
+            distinct_count = column_meta.get("distinct_count")
+            if distinct_count is not None and row_count > 0 and int(distinct_count) <= min(50, max(5, int(0.02 * row_count))):
+                low_card_cols += 1
+        if row_count > 0 and low_card_cols >= max(2, len(columns) // 2):
+            return "lookup"
         return "entity"
 
-    def _column_role(self, col: str, dtype: str) -> str:
-        c = col.lower()
-        if c.endswith("id") or c == "id":
+    def _column_role(
+        self,
+        column_name: str,
+        dtype_name: str,
+        column_stats: dict[str, Any],
+    ) -> str:
+        low = column_name.lower()
+        distinct_count = column_stats.get("distinct_count")
+        non_null_count = int(column_stats.get("non_null_count", 0) or 0)
+        cardinality_ratio = (
+            float(distinct_count) / max(1, non_null_count)
+            if distinct_count is not None and non_null_count > 0
+            else 0.0
+        )
+        if low == "id" or low.endswith("id") or low.endswith("_key"):
             return "id"
-        if "date" in c or "time" in c or "timestamp" in c:
+        if is_temporal_dtype_name(dtype_name) or any(tok in low for tok in ["date", "time", "timestamp"]):
             return "timestamp"
-        if any(tok in c for tok in ["status", "type", "category"]):
+        if low.startswith(("is_", "has_")) or low.endswith("_flag") or "status" in low or "state" in low:
+            return "status"
+        if is_boolean_dtype_name(dtype_name):
+            return "status"
+        if is_text_dtype_name(dtype_name):
+            if any(tok in low for tok in ["name", "title", "desc", "description", "text", "body", "comment", "message"]):
+                return "text"
+            if distinct_count is not None and int(distinct_count) > 50:
+                return "text"
             return "category"
-        if any(tok in c for tok in ["count", "mean", "std", "sum", "max", "min", "score", "value", "amount", "points"]):
+        if is_numeric_dtype_name(dtype_name):
+            if cardinality_ratio >= 0.98 and any(tok in low for tok in ["id", "key"]):
+                return "id"
             return "measure"
-        if "object" in dtype or "string" in dtype:
+        if distinct_count is not None and int(distinct_count) <= 20:
             return "category"
-        return "measure"
+        return "other"
 
-    def _build_semantics_artifact(self, db: Any, filtered: dict[str, pd.DataFrame], cutoff: pd.Timestamp) -> dict[str, Any]:
+    def _column_prior_info(
+        self,
+        *,
+        column_name: str,
+        dtype_name: str,
+        column_stats: dict[str, Any],
+    ) -> dict[str, Any]:
+        non_null = int(column_stats.get("non_null_count", 0) or 0)
+        unique = column_stats.get("distinct_count")
+        heuristic_role = self._column_role(column_name, dtype_name, column_stats)
+        top_values = []
+        categorical_meta = column_stats.get("categorical", {})
+        if isinstance(categorical_meta, dict):
+            top_values = categorical_meta.get("top_values", [])[:5]
+        numeric_meta = column_stats.get("numeric", {})
+        numeric_range = None
+        if isinstance(numeric_meta, dict) and numeric_meta:
+            numeric_range = {
+                "min": numeric_meta.get("min"),
+                "max": numeric_meta.get("max"),
+                "median": numeric_meta.get("median"),
+            }
+        return {
+            "name": column_name,
+            "dtype": dtype_name,
+            "non_null": non_null,
+            "missing_ratio": column_stats.get("missingness"),
+            "unique": unique,
+            "unique_ratio": (float(unique) / max(1, non_null)) if unique is not None and non_null > 0 else 0.0,
+            "heuristic_prior_role": heuristic_role,
+            "top_values": top_values,
+            "numeric_range": numeric_range,
+        }
+
+    def _build_semantics_artifact(
+        self,
+        schema_artifact: dict[str, Any],
+        stats_artifact: dict[str, Any],
+        cutoff: pd.Timestamp,
+    ) -> dict[str, Any]:
         header = self._artifact_header(cutoff)
+        stats_by_table = {
+            str(table.get("table_name", "")): table
+            for table in stats_artifact.get("tables", [])
+        }
         tables = []
         leakage_patterns = ["label", "target", "future", "leak", "outcome"]
         llm_used = False
         llm_failures = 0
         llm_diagnostics: list[dict[str, Any]] = []
         llm = self._get_llm() if self.config.use_llm_semantics else None
-        for table_name, table in db.table_dict.items():
-            frame = filtered[table_name]
-            table_role = self._table_role(table_name, table)
-            columns = []
+
+        for schema_table in schema_artifact.get("tables", []):
+            table_name = str(schema_table.get("table_name", ""))
+            stats_table = stats_by_table.get(table_name, {})
+            table_role = self._table_role(table_name, schema_table, stats_table)
+            col_specs = [
+                self._column_prior_info(
+                    column_name=str(column.get("name", "")),
+                    dtype_name=str(column.get("dtype", "")),
+                    column_stats=(stats_table.get("columns", {}) or {}).get(str(column.get("name", "")), {}),
+                )
+                for column in schema_table.get("columns", [])
+            ]
             llm_result: dict[str, Any] | None = None
             if llm is not None:
                 llm_result, diag = self._annotate_table_semantics_with_llm(
                     llm=llm,
                     table_name=table_name,
-                    frame=frame,
-                    provided_time_col=table.time_col,
+                    heuristic_table_role=table_role,
+                    provided_time_col=schema_table.get("time_column"),
+                    column_specs=col_specs,
                 )
                 llm_diagnostics.append(diag)
                 if llm_result is not None:
@@ -651,16 +665,20 @@ class Phase1Pipeline:
                 else:
                     llm_failures += 1
 
+            columns = []
+            spec_by_name = {spec["name"]: spec for spec in col_specs}
             if llm_result is not None:
                 llm_table_role = self._normalize_table_role(llm_result.get("table_role"), table_role)
                 table_role_conf = float(llm_result.get("table_role_confidence", 0.0))
-                table_role = llm_table_role if table_role_conf >= self.config.llm_semantics_confidence_threshold else table_role
+                if table_role_conf >= self.config.llm_semantics_confidence_threshold:
+                    table_role = llm_table_role
                 llm_columns = llm_result.get("columns", {})
-                for col in frame.columns:
-                    col_info = llm_columns.get(col, {})
-                    heuristic_role = self._column_role(col, str(frame[col].dtype))
+                for spec in col_specs:
+                    column_name = spec["name"]
+                    col_info = llm_columns.get(column_name, {})
+                    heuristic_role = spec["heuristic_prior_role"]
                     llm_role = self._normalize_column_role(col_info.get("semantic_role"), heuristic_role)
-                    llm_role = self._semantic_rule_override(col, llm_role, heuristic_role)
+                    llm_role = self._semantic_rule_override(column_name, llm_role, heuristic_role)
                     llm_conf = float(col_info.get("confidence", 0.0))
                     llm_abstain = bool(col_info.get("abstain", False))
                     if llm_abstain or llm_conf < self.config.llm_semantics_confidence_threshold:
@@ -669,10 +687,15 @@ class Phase1Pipeline:
                     else:
                         role = llm_role
                         confidence = "llm"
-                    leakage_risk = bool(col_info.get("leakage_risk", any(p in col.lower() for p in leakage_patterns)))
+                    leakage_risk = bool(
+                        col_info.get(
+                            "leakage_risk",
+                            any(pattern in column_name.lower() for pattern in leakage_patterns),
+                        )
+                    )
                     columns.append(
                         {
-                            "name": col,
+                            "name": column_name,
                             "semantic_role": role,
                             "leakage_risk": leakage_risk,
                             "confidence": confidence,
@@ -682,13 +705,13 @@ class Phase1Pipeline:
                         }
                     )
             else:
-                for col in frame.columns:
-                    role = self._column_role(col, str(frame[col].dtype))
-                    col_l = col.lower()
-                    leakage_risk = any(p in col_l for p in leakage_patterns)
+                for spec in col_specs:
+                    column_name = spec["name"]
+                    role = spec["heuristic_prior_role"]
+                    leakage_risk = any(pattern in column_name.lower() for pattern in leakage_patterns)
                     columns.append(
                         {
-                            "name": col,
+                            "name": column_name,
                             "semantic_role": role,
                             "leakage_risk": leakage_risk,
                             "confidence": "heuristic",
@@ -701,15 +724,16 @@ class Phase1Pipeline:
                 {
                     "table_name": table_name,
                     "table_role": table_role,
-                    "time_column": table.time_col,
+                    "time_column": schema_table.get("time_column"),
                     "columns": columns,
                 }
             )
+
         validation = self._validate_semantics_tables(tables)
         return {
             **header,
             "annotation_model": {
-                "name": f"local-llama-{self.config.llm_model_size}" if llm_used else "heuristic-baseline",
+                "name": f"local-llama-{self.config.llm_model_size}" if llm_used else "heuristic-summary-baseline",
                 "llm_used": llm_used,
                 "llm_failures": llm_failures,
                 "determinism": {
@@ -719,9 +743,9 @@ class Phase1Pipeline:
                     "max_retries_on_parse_failure": 2,
                 },
                 "notes": (
-                    "LLM semantic annotation enabled with deterministic generation and JSON parsing."
+                    "LLM semantic annotation enabled with deterministic generation over schema/stats summaries."
                     if llm_used
-                    else "Heuristic semantic baseline. Enable --use-llm-semantics to use local Llama."
+                    else "Heuristic semantic baseline built from schema/stats summaries."
                 ),
             },
             "llm_diagnostics": llm_diagnostics,
@@ -732,25 +756,42 @@ class Phase1Pipeline:
     def _validate_semantics_tables(self, tables: list[dict[str, Any]]) -> dict[str, Any]:
         issues: list[dict[str, Any]] = []
         for table in tables:
-            tname = table.get("table_name", "")
-            trole = str(table.get("table_role", ""))
-            if trole not in ALLOWED_TABLE_ROLES:
-                issues.append({"type": "invalid_table_role", "table": tname, "value": trole})
-            for col in table.get("columns", []):
-                cname = col.get("name", "")
-                role = str(col.get("semantic_role", ""))
-                if role not in ALLOWED_COLUMN_ROLES:
-                    issues.append({"type": "invalid_column_role", "table": tname, "column": cname, "value": role})
-                low = str(cname).lower()
-                if any(tok in low for tok in ["date", "time", "timestamp"]) and role != "timestamp":
-                    issues.append({"type": "timestamp_name_mismatch", "table": tname, "column": cname, "value": role})
-                if low.endswith("id") and role != "id":
-                    issues.append({"type": "id_name_mismatch", "table": tname, "column": cname, "value": role})
-        return {
-            "issue_count": len(issues),
-            "issues": issues[:500],
-            "passed": len(issues) == 0,
-        }
+            table_name = table.get("table_name", "")
+            table_role = str(table.get("table_role", ""))
+            if table_role not in ALLOWED_TABLE_ROLES:
+                issues.append({"type": "invalid_table_role", "table": table_name, "value": table_role})
+            for column in table.get("columns", []):
+                column_name = column.get("name", "")
+                semantic_role = str(column.get("semantic_role", ""))
+                if semantic_role not in ALLOWED_COLUMN_ROLES:
+                    issues.append(
+                        {
+                            "type": "invalid_column_role",
+                            "table": table_name,
+                            "column": column_name,
+                            "value": semantic_role,
+                        }
+                    )
+                lower = str(column_name).lower()
+                if any(tok in lower for tok in ["date", "time", "timestamp"]) and semantic_role != "timestamp":
+                    issues.append(
+                        {
+                            "type": "timestamp_name_mismatch",
+                            "table": table_name,
+                            "column": column_name,
+                            "value": semantic_role,
+                        }
+                    )
+                if lower.endswith("id") and semantic_role != "id":
+                    issues.append(
+                        {
+                            "type": "id_name_mismatch",
+                            "table": table_name,
+                            "column": column_name,
+                            "value": semantic_role,
+                        }
+                    )
+        return {"issue_count": len(issues), "issues": issues[:500], "passed": len(issues) == 0}
 
     def _extract_json_object(self, text: str) -> dict[str, Any] | None:
         start = text.find("{")
@@ -769,7 +810,6 @@ class Phase1Pipeline:
         role_s = str(role).strip().lower()
         if role_s in ALLOWED_TABLE_ROLES:
             return role_s
-        # Repair common malformed cases like "entity|event".
         for token in re.split(r"[^a-z]+", role_s):
             if token in ALLOWED_TABLE_ROLES:
                 return token
@@ -786,34 +826,11 @@ class Phase1Pipeline:
                 return token
         return fallback
 
-    def _column_prior_info(self, series: pd.Series, col_name: str) -> dict[str, Any]:
-        non_null = int(series.notna().sum())
-        n = len(series)
-        unique = _safe_nunique(series, dropna=True)
-        prior_role = self._column_role(col_name, str(series.dtype))
-        top_values = []
-        try:
-            top = series.dropna().astype(str).value_counts().head(5)
-            top_values = [{"value": k, "count": int(v)} for k, v in top.items()]
-        except Exception:
-            top_values = []
-        return {
-            "name": col_name,
-            "dtype": str(series.dtype),
-            "non_null": non_null,
-            "missing_ratio": float(series.isna().mean()) if n else None,
-            "unique": unique,
-            "unique_ratio": float(unique / max(1, non_null)) if non_null else 0.0,
-            "heuristic_prior_role": prior_role,
-            "top_values": top_values,
-        }
-
-    def _semantic_rule_override(self, col_name: str, role: str, heuristic_role: str) -> str:
-        c = col_name.lower()
-        # Hard safety-style overrides for obvious tokens.
-        if c.endswith("id") and role != "id":
+    def _semantic_rule_override(self, column_name: str, role: str, heuristic_role: str) -> str:
+        lower = column_name.lower()
+        if lower.endswith("id") and role != "id":
             return "id"
-        if any(tok in c for tok in ["date", "time", "timestamp"]) and role != "timestamp":
+        if any(tok in lower for tok in ["date", "time", "timestamp"]) and role != "timestamp":
             return "timestamp"
         if role not in ALLOWED_COLUMN_ROLES:
             return heuristic_role
@@ -823,13 +840,14 @@ class Phase1Pipeline:
         self,
         *,
         table_name: str,
+        heuristic_table_role: str,
         provided_time_col: str | None,
-        col_specs: list[dict[str, Any]],
-        variant: str = "primary",
+        column_specs: list[dict[str, Any]],
+        variant: str,
     ) -> str:
-        lead = "Use heuristic priors as guidance, not absolute truth."
+        lead = "Use the summary features as guidance, not absolute truth."
         if variant == "alt":
-            lead = "Focus on consistency between names, dtypes, and priors. If uncertain, abstain."
+            lead = "Focus on consistency between names, dtypes, cardinality, and priors. If uncertain, abstain."
         return (
             "You are labeling relational database semantics.\n"
             f"{lead}\n"
@@ -848,8 +866,9 @@ class Phase1Pipeline:
             "}\n"
             "No markdown, no prose.\n\n"
             f"Table name: {table_name}\n"
+            f"Heuristic table role: {heuristic_table_role}\n"
             f"Provided time column: {provided_time_col}\n"
-            f"Columns with priors:\n{json.dumps(col_specs, ensure_ascii=True)}\n"
+            f"Columns with priors:\n{json.dumps(column_specs, ensure_ascii=True)}\n"
         )
 
     def _build_semantics_critic_prompt(self, candidate_json: dict[str, Any], table_name: str) -> str:
@@ -868,18 +887,16 @@ class Phase1Pipeline:
         *,
         parsed: dict[str, Any],
         table_name: str,
-        frame: pd.DataFrame,
         heuristic_table_role: str,
+        column_specs: list[dict[str, Any]],
     ) -> tuple[dict[str, Any], list[str]]:
         issues: list[str] = []
         out: dict[str, Any] = {"columns": {}}
-
         out["table_role"] = self._normalize_table_role(parsed.get("table_role"), heuristic_table_role)
         if out["table_role"] != str(parsed.get("table_role", "")).strip().lower():
             issues.append(f"{table_name}: repaired_table_role")
-        trc = parsed.get("table_role_confidence", 0.0)
         try:
-            out["table_role_confidence"] = max(0.0, min(1.0, float(trc)))
+            out["table_role_confidence"] = max(0.0, min(1.0, float(parsed.get("table_role_confidence", 0.0))))
         except Exception:
             out["table_role_confidence"] = 0.0
             issues.append(f"{table_name}: invalid_table_role_confidence")
@@ -889,24 +906,30 @@ class Phase1Pipeline:
             llm_columns = {}
             issues.append(f"{table_name}: invalid_columns_object")
 
-        for col in frame.columns:
-            heuristic_role = self._column_role(col, str(frame[col].dtype))
-            cobj = llm_columns.get(col, {})
-            if not isinstance(cobj, dict):
-                cobj = {}
-                issues.append(f"{table_name}.{col}: invalid_column_payload")
-            role = self._normalize_column_role(cobj.get("semantic_role"), heuristic_role)
-            role = self._semantic_rule_override(col, role, heuristic_role)
+        for spec in column_specs:
+            column_name = spec["name"]
+            heuristic_role = spec["heuristic_prior_role"]
+            payload = llm_columns.get(column_name, {})
+            if not isinstance(payload, dict):
+                payload = {}
+                issues.append(f"{table_name}.{column_name}: invalid_column_payload")
+            role = self._normalize_column_role(payload.get("semantic_role"), heuristic_role)
+            role = self._semantic_rule_override(column_name, role, heuristic_role)
             try:
-                conf = float(cobj.get("confidence", 0.0))
+                confidence = float(payload.get("confidence", 0.0))
             except Exception:
-                conf = 0.0
-            conf = max(0.0, min(1.0, conf))
-            abstain = bool(cobj.get("abstain", False))
-            leakage_risk = bool(cobj.get("leakage_risk", any(p in col.lower() for p in ["label", "target", "future", "leak", "outcome"])))
-            out["columns"][col] = {
+                confidence = 0.0
+            confidence = max(0.0, min(1.0, confidence))
+            abstain = bool(payload.get("abstain", False))
+            leakage_risk = bool(
+                payload.get(
+                    "leakage_risk",
+                    any(tok in column_name.lower() for tok in ["label", "target", "future", "leak", "outcome"]),
+                )
+            )
+            out["columns"][column_name] = {
                 "semantic_role": role,
-                "confidence": conf,
+                "confidence": confidence,
                 "abstain": abstain,
                 "leakage_risk": leakage_risk,
             }
@@ -917,8 +940,9 @@ class Phase1Pipeline:
         *,
         llm: LocalLLM,
         table_name: str,
-        frame: pd.DataFrame,
+        heuristic_table_role: str,
         provided_time_col: str | None,
+        column_specs: list[dict[str, Any]],
     ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
         diagnostics: dict[str, Any] = {
             "table_name": table_name,
@@ -927,25 +951,23 @@ class Phase1Pipeline:
             "llm_ensemble_used": False,
             "issues": [],
         }
-        heuristic_table_role = self._table_role(table_name, type("T", (), {"time_col": provided_time_col})())
-        col_specs = [self._column_prior_info(frame[col], col) for col in frame.columns]
 
         def _run_prompt(prompt: str) -> dict[str, Any] | None:
             for _ in range(3):
                 try:
-                    out = llm.generate_batch([prompt], max_new_tokens=self.config.llm_semantics_max_new_tokens)[0]
-                    parsed = self._extract_json_object(out)
+                    output = llm.generate_batch([prompt], max_new_tokens=self.config.llm_semantics_max_new_tokens)[0]
+                    parsed = self._extract_json_object(output)
                     if isinstance(parsed, dict):
                         return parsed
                 except Exception:
                     pass
             return None
 
-        # Pass 1: solver
         primary_prompt = self._build_semantics_prompt(
             table_name=table_name,
+            heuristic_table_role=heuristic_table_role,
             provided_time_col=provided_time_col,
-            col_specs=col_specs,
+            column_specs=column_specs,
             variant="primary",
         )
         parsed_primary = _run_prompt(primary_prompt)
@@ -956,12 +978,11 @@ class Phase1Pipeline:
         primary_sanitized, primary_issues = self._sanitize_llm_semantics_result(
             parsed=parsed_primary,
             table_name=table_name,
-            frame=frame,
             heuristic_table_role=heuristic_table_role,
+            column_specs=column_specs,
         )
         diagnostics["issues"].extend(primary_issues)
 
-        # Pass 2: critic repair
         critic_prompt = self._build_semantics_critic_prompt(primary_sanitized, table_name)
         parsed_critic = _run_prompt(critic_prompt)
         final_sanitized = primary_sanitized
@@ -970,29 +991,27 @@ class Phase1Pipeline:
             critic_sanitized, critic_issues = self._sanitize_llm_semantics_result(
                 parsed=parsed_critic,
                 table_name=table_name,
-                frame=frame,
                 heuristic_table_role=heuristic_table_role,
+                column_specs=column_specs,
             )
             diagnostics["issues"].extend(critic_issues)
             final_sanitized = critic_sanitized
 
-        # Light ensemble only for ambiguous cases.
         ambiguity_score = 0
-        for col in frame.columns:
-            h = self._column_role(col, str(frame[col].dtype))
-            r = final_sanitized["columns"][col]["semantic_role"]
-            c = float(final_sanitized["columns"][col]["confidence"])
-            abstain = bool(final_sanitized["columns"][col]["abstain"])
-            if abstain or c < self.config.llm_semantics_confidence_threshold or r != h:
+        for spec in column_specs:
+            heuristic_role = spec["heuristic_prior_role"]
+            column_name = spec["name"]
+            result = final_sanitized["columns"][column_name]
+            if bool(result.get("abstain")) or float(result.get("confidence", 0.0)) < self.config.llm_semantics_confidence_threshold:
                 ambiguity_score += 1
-        if (
-            self.config.llm_semantics_use_ensemble
-            and ambiguity_score > max(2, int(0.2 * max(1, len(frame.columns))))
-        ):
+            elif str(result.get("semantic_role")) != heuristic_role:
+                ambiguity_score += 1
+        if self.config.llm_semantics_use_ensemble and ambiguity_score > max(2, int(0.2 * max(1, len(column_specs)))):
             alt_prompt = self._build_semantics_prompt(
                 table_name=table_name,
+                heuristic_table_role=heuristic_table_role,
                 provided_time_col=provided_time_col,
-                col_specs=col_specs,
+                column_specs=column_specs,
                 variant="alt",
             )
             parsed_alt = _run_prompt(alt_prompt)
@@ -1001,245 +1020,121 @@ class Phase1Pipeline:
                 alt_sanitized, alt_issues = self._sanitize_llm_semantics_result(
                     parsed=parsed_alt,
                     table_name=table_name,
-                    frame=frame,
                     heuristic_table_role=heuristic_table_role,
+                    column_specs=column_specs,
                 )
                 diagnostics["issues"].extend(alt_issues)
-                # Majority vote: primary/critic result + alt + heuristic tie-breaker.
                 role_votes = [
                     final_sanitized.get("table_role", heuristic_table_role),
                     alt_sanitized.get("table_role", heuristic_table_role),
                     heuristic_table_role,
                 ]
-                final_sanitized["table_role"] = Counter(role_votes).most_common(1)[0][0]
-                for col in frame.columns:
+                final_sanitized["table_role"] = max(set(role_votes), key=role_votes.count)
+                for spec in column_specs:
+                    column_name = spec["name"]
                     votes = [
-                        final_sanitized["columns"][col]["semantic_role"],
-                        alt_sanitized["columns"][col]["semantic_role"],
-                        self._column_role(col, str(frame[col].dtype)),
+                        final_sanitized["columns"][column_name]["semantic_role"],
+                        alt_sanitized["columns"][column_name]["semantic_role"],
+                        spec["heuristic_prior_role"],
                     ]
-                    voted = Counter(votes).most_common(1)[0][0]
-                    final_sanitized["columns"][col]["semantic_role"] = voted
-                    final_sanitized["columns"][col]["confidence"] = max(
-                        float(final_sanitized["columns"][col].get("confidence", 0.0)),
-                        float(alt_sanitized["columns"][col].get("confidence", 0.0)),
+                    voted = max(set(votes), key=votes.count)
+                    final_sanitized["columns"][column_name]["semantic_role"] = voted
+                    final_sanitized["columns"][column_name]["confidence"] = max(
+                        float(final_sanitized["columns"][column_name].get("confidence", 0.0)),
+                        float(alt_sanitized["columns"][column_name].get("confidence", 0.0)),
                     )
-                    final_sanitized["columns"][col]["abstain"] = bool(
-                        final_sanitized["columns"][col].get("abstain", False)
-                    ) and bool(alt_sanitized["columns"][col].get("abstain", False))
+                    final_sanitized["columns"][column_name]["abstain"] = bool(
+                        final_sanitized["columns"][column_name].get("abstain", False)
+                    ) and bool(alt_sanitized["columns"][column_name].get("abstain", False))
 
         return final_sanitized, diagnostics
-
-    def _build_path_catalog_artifact(self, db: Any, filtered: dict[str, pd.DataFrame], cutoff: pd.Timestamp) -> dict[str, Any]:
-        header = self._artifact_header(cutoff)
-
-        fk_edges: list[dict[str, Any]] = []
-        for child_name, table in db.table_dict.items():
-            child_df = filtered[child_name]
-            for fk_col, parent_name in table.fkey_col_to_pkey_table.items():
-                if fk_col not in child_df.columns:
-                    continue
-                parent = db.table_dict.get(parent_name)
-                if parent is None or parent.pkey_col is None:
-                    continue
-                parent_df = filtered[parent_name]
-                if parent.pkey_col not in parent_df.columns:
-                    continue
-                cvals = set(child_df[fk_col].dropna().unique().tolist())
-                pvals = set(parent_df[parent.pkey_col].dropna().unique().tolist())
-                overlap = len(cvals & pvals)
-                ratio = overlap / max(1, len(cvals)) if cvals else 0.0
-                confidence = "high" if ratio >= 0.98 else ("medium" if ratio >= 0.9 else "low")
-                fk_edges.append(
-                    {
-                        "child_table": child_name,
-                        "child_column": fk_col,
-                        "parent_table": parent_name,
-                        "parent_column": parent.pkey_col,
-                        "source": "provided",
-                        "join_types": ["inner", "left"],
-                        "confidence": confidence,
-                        "recommended_by_default": confidence != "low",
-                        "overlap_ratio": ratio,
-                    }
-                )
-
-        inferred_edges = self._infer_fk_candidates(db, filtered)
-        existing_keys = {
-            (
-                e["child_table"],
-                e["child_column"],
-                e["parent_table"],
-                e["parent_column"],
-            )
-            for e in fk_edges
-        }
-        for edge in inferred_edges:
-            edge_key = (
-                edge["child_table"],
-                edge["child_column"],
-                edge["parent_table"],
-                edge["parent_column"],
-            )
-            if edge_key in existing_keys:
-                continue
-            fk_edges.append(
-                {
-                    **edge,
-                    "source": "inferred",
-                    "join_types": ["inner", "left"],
-                }
-            )
-
-        graph: dict[str, list[tuple[str, dict[str, Any]]]] = {}
-        for edge in fk_edges:
-            graph.setdefault(edge["child_table"], []).append((edge["parent_table"], edge))
-
-        paths = []
-        truncated = False
-        for start in sorted(graph.keys()):
-            frontier = [([start], [])]
-            expanded = 0
-            while frontier:
-                nodes, used_edges = frontier.pop()
-                expanded += 1
-                if expanded > self.config.max_frontier_per_start:
-                    truncated = True
-                    break
-                if len(nodes) - 1 >= self.config.max_path_depth:
-                    continue
-                last = nodes[-1]
-                for nxt, edge in graph.get(last, []):
-                    if nxt in nodes:
-                        continue
-                    new_nodes = nodes + [nxt]
-                    new_edges = used_edges + [edge]
-                    fanouts = []
-                    for e in new_edges:
-                        child_rows = len(filtered[e["child_table"]])
-                        child_unique = max(1, _safe_nunique(filtered[e["child_table"]][e["child_column"]], dropna=True))
-                        fanouts.append(child_rows / child_unique)
-                    estimated_multiplier = float(np.prod(fanouts)) if fanouts else 1.0
-                    recommended = all(e.get("recommended_by_default", True) for e in new_edges)
-                    paths.append(
-                        {
-                            "path_tables": new_nodes,
-                            "path_edges": new_edges,
-                            "depth": len(new_nodes) - 1,
-                            "estimated_row_multiplier": estimated_multiplier,
-                            "recommended": recommended,
-                            "temporal_valid": True,
-                        }
-                    )
-                    if len(paths) >= self.config.max_paths:
-                        truncated = True
-                        break
-                    frontier.append((new_nodes, new_edges))
-                if truncated:
-                    break
-            if truncated:
-                break
-
-        paths.sort(key=lambda x: (x["depth"], x["estimated_row_multiplier"], x["path_tables"]))
-
-        path_scoring_report = {
-            "llm_used": False,
-            "scored_count": 0,
-            "top_k": self.config.llm_path_top_k,
-            "failures": 0,
-        }
-        if self.config.use_llm_path_scoring and self.config.use_llm_semantics and paths:
-            llm = self._get_llm()
-            score_count = min(self.config.llm_path_top_k, len(paths))
-            scored = 0
-            failures = 0
-            for idx in range(score_count):
-                path_obj = paths[idx]
-                scored_obj = self._score_path_with_llm(llm, path_obj)
-                if scored_obj is None:
-                    failures += 1
-                    continue
-                path_obj.update(scored_obj)
-                scored += 1
-            path_scoring_report = {
-                "llm_used": True,
-                "scored_count": scored,
-                "top_k": self.config.llm_path_top_k,
-                "failures": failures,
-            }
-
-        return {
-            **header,
-            "max_path_depth": self.config.max_path_depth,
-            "max_paths_cap": self.config.max_paths,
-            "truncated": truncated,
-            "path_scoring_report": path_scoring_report,
-            "foreign_key_edges": fk_edges,
-            "paths": paths,
-        }
-
-    def _score_path_with_llm(self, llm: LocalLLM, path_obj: dict[str, Any]) -> dict[str, Any] | None:
-        prompt = (
-            "You are scoring relational join paths for dataset-aware retrieval quality.\n"
-            "Return STRICT JSON only with fields:\n"
-            "{\n"
-            '  "semantic_relevance": <float 0..1>,\n'
-            '  "temporal_risk": <float 0..1>,\n'
-            '  "cardinality_risk": <float 0..1>,\n'
-            '  "recommended": true|false,\n'
-            '  "rationale_short": "<short text>"\n'
-            "}\n"
-            "No markdown.\n\n"
-            f"Path tables: {json.dumps(path_obj.get('path_tables', []), ensure_ascii=True)}\n"
-            f"Depth: {path_obj.get('depth')}\n"
-            f"Estimated row multiplier: {path_obj.get('estimated_row_multiplier')}\n"
-            f"Current recommended flag: {path_obj.get('recommended')}\n"
-        )
-        try:
-            out = llm.generate_batch([prompt], max_new_tokens=192)[0]
-            parsed = self._extract_json_object(out)
-            if not isinstance(parsed, dict):
-                return None
-            sem = float(parsed.get("semantic_relevance", 0.0))
-            tr = float(parsed.get("temporal_risk", 1.0))
-            cr = float(parsed.get("cardinality_risk", 1.0))
-            rec = bool(parsed.get("recommended", False))
-            rationale = str(parsed.get("rationale_short", ""))[:240]
-            return {
-                "llm_semantic_relevance": max(0.0, min(1.0, sem)),
-                "llm_temporal_risk": max(0.0, min(1.0, tr)),
-                "llm_cardinality_risk": max(0.0, min(1.0, cr)),
-                "llm_recommended": rec,
-                "llm_rationale_short": rationale,
-            }
-        except Exception:
-            return None
 
     def _build_semantic_context_graph_artifact(
         self,
         *,
-        db: Any,
-        filtered: dict[str, pd.DataFrame],
         cutoff: pd.Timestamp,
         schema_artifact: dict[str, Any],
         stats_artifact: dict[str, Any],
         semantics_artifact: dict[str, Any],
+        fk_catalog: list[dict[str, Any]],
     ) -> dict[str, Any]:
         header = self._artifact_header(cutoff)
         graph = build_semantic_context_graph(
-            db=db,
-            filtered=filtered,
             schema_artifact=schema_artifact,
             stats_artifact=stats_artifact,
             semantics_artifact=semantics_artifact,
-            infer_fk_candidates_fn=infer_fk_candidates,
-            table_role_fn=self._table_role,
+            fk_edges=fk_catalog,
         )
         return {**header, **graph}
-    def _build_safety_artifact(self, cutoff: pd.Timestamp) -> dict[str, Any]:
+
+    def _build_path_catalog_artifact(
+        self,
+        cutoff: pd.Timestamp,
+        fk_catalog: list[dict[str, Any]],
+    ) -> dict[str, Any]:
         header = self._artifact_header(cutoff)
         return {
             **header,
+            "max_path_depth": self.config.max_path_depth,
+            "max_paths_cap": self.config.max_paths,
+            "truncated": False,
+            "path_scoring_report": {
+                "llm_used": False,
+                "scored_count": 0,
+                "top_k": self.config.llm_path_top_k,
+                "failures": 0,
+            },
+            "foreign_key_edges": fk_catalog,
+            "paths": [],
+            "notes": "Path catalog generation is intentionally deferred in this SQL-first scalable refactor.",
+        }
+
+    def _build_safety_artifact(
+        self,
+        *,
+        cutoff: pd.Timestamp,
+        access: Phase1DataAccess,
+        cutoff_info: dict[str, Any],
+        schema_artifact: dict[str, Any],
+        stats_artifact: dict[str, Any],
+        semantics_artifact: dict[str, Any],
+        fk_catalog: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        header = self._artifact_header(cutoff)
+        invalid_time_tables = []
+        static_tables = []
+        metadata_warnings = []
+        for table in schema_artifact.get("tables", []):
+            if int(table.get("rows_dropped_invalid_time", 0)) > 0:
+                invalid_time_tables.append(
+                    {
+                        "table_name": table.get("table_name"),
+                        "rows_dropped_invalid_time": table.get("rows_dropped_invalid_time"),
+                    }
+                )
+            if table.get("time_column") is None:
+                static_tables.append(str(table.get("table_name", "")))
+            if table.get("metadata_warnings"):
+                metadata_warnings.append(
+                    {
+                        "table_name": table.get("table_name"),
+                        "warnings": table.get("metadata_warnings"),
+                    }
+                )
+        leakage_prone_columns = []
+        for table in semantics_artifact.get("tables", []):
+            for column in table.get("columns", []):
+                if bool(column.get("leakage_risk", False)):
+                    leakage_prone_columns.append(
+                        {
+                            "table_name": table.get("table_name"),
+                            "column_name": column.get("name"),
+                            "semantic_role": column.get("semantic_role"),
+                        }
+                    )
+        return {
+            **header,
+            "cutoff_diagnostics": cutoff_info,
             "rules": {
                 "global_temporal_cutoff": {
                     "description": "No rows at or beyond val_start are visible in Phase 1.",
@@ -1254,38 +1149,178 @@ class Phase1Pipeline:
                     "allowed": False,
                     "description": "No manual denylist/allowlist in Phase 1.",
                 },
+                "profiling_budget_modes": {
+                    "allowed_values": ["exact", "sampled", "approx", "skipped"],
+                    "default_large_table_mode": "sampled",
+                },
+            },
+            "observations": {
+                "tables_with_invalid_time_rows": invalid_time_tables,
+                "static_tables": static_tables,
+                "metadata_warnings": metadata_warnings,
+                "leakage_prone_columns": leakage_prone_columns,
+                "foreign_key_summary": {
+                    "provided_count": sum(1 for fk in fk_catalog if fk.get("source") == "provided"),
+                    "inferred_count": sum(1 for fk in fk_catalog if fk.get("source") != "provided"),
+                    "low_confidence_count": sum(1 for fk in fk_catalog if fk.get("confidence") == "low"),
+                },
+            },
+            "validation": {
+                "cutoff_errors": cutoff_info.get("errors", []),
+                "cutoff_warnings": cutoff_info.get("warnings", []),
+                "semantics_validation_passed": bool(
+                    (semantics_artifact.get("validation", {}) or {}).get("passed", False)
+                ),
+                "table_count": len(schema_artifact.get("tables", [])),
             },
         }
 
 
-def build_arg_parser() -> argparse.ArgumentParser:
+def _load_config_file(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        raise FileNotFoundError(f"Config file not found: {path}")
+    raw = path.read_text(encoding="utf-8")
+    if path.suffix.lower() == ".json":
+        return json.loads(raw)
+    try:
+        import yaml  # type: ignore
+    except Exception as exc:
+        raise RuntimeError("PyYAML is required to load YAML config files.") from exc
+    payload = yaml.safe_load(raw) or {}
+    if not isinstance(payload, dict):
+        raise ValueError(f"Expected mapping config in {path}")
+    return payload
+
+
+def build_arg_parser(defaults: dict[str, Any] | None = None) -> argparse.ArgumentParser:
+    defaults = defaults or {}
     parser = argparse.ArgumentParser(description="Phase 1 DB intelligence extraction pipeline")
-    parser.add_argument("--dataset", type=str, default="rel-f1")
-    parser.add_argument("--output-dir", type=Path, default=Path("artifacts/v2/phase1"))
-    parser.add_argument("--max-path-depth", type=int, default=8)
-    parser.add_argument("--sampling-row-threshold", type=int, default=200_000)
-    parser.add_argument("--sample-size", type=int, default=100_000)
-    parser.add_argument("--correlation-topk-per-table", type=int, default=30)
-    parser.add_argument("--correlation-global-cap", type=int, default=500)
-    parser.add_argument("--stats-workers", type=int, default=1)
-    parser.add_argument("--disable-sampling", action="store_true")
-    parser.add_argument("--max-paths", type=int, default=50_000)
-    parser.add_argument("--max-frontier-per-start", type=int, default=5_000)
-    parser.add_argument("--skip-correlations", action="store_true")
-    parser.add_argument("--disable-stats-checkpoint-resume", action="store_true")
-    parser.add_argument("--use-llm-semantics", action="store_true")
-    parser.add_argument("--llm-model-size", choices=sorted(MODEL_PATHS), default="8b")
-    parser.add_argument("--use-llm-path-scoring", action="store_true")
-    parser.add_argument("--llm-path-top-k", type=int, default=200)
-    parser.add_argument("--compute-path-catalog", action="store_true")
-    parser.add_argument("--llm-semantics-confidence-threshold", type=float, default=0.6)
-    parser.add_argument("--disable-llm-semantics-ensemble", action="store_true")
+    parser.add_argument("--config", type=Path, default=None)
+    parser.add_argument("--dataset", type=str, default=defaults.get("dataset", "rel-f1"))
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=Path(defaults.get("output_dir", "artifacts/v2/phase1")),
+    )
+    parser.add_argument("--max-path-depth", type=int, default=int(defaults.get("max_path_depth", 8)))
+    parser.add_argument(
+        "--sampling-row-threshold",
+        type=int,
+        default=int(defaults.get("sampling_row_threshold", 200_000)),
+    )
+    parser.add_argument("--sample-size", type=int, default=int(defaults.get("sample_size", 100_000)))
+    parser.add_argument(
+        "--correlation-topk-per-table",
+        type=int,
+        default=int(defaults.get("correlation_topk_per_table", 30)),
+    )
+    parser.add_argument(
+        "--correlation-global-cap",
+        type=int,
+        default=int(defaults.get("correlation_global_cap", 500)),
+    )
+    parser.add_argument(
+        "--correlation-sample-size",
+        type=int,
+        default=int(defaults.get("correlation_sample_size", 50_000)),
+    )
+    parser.add_argument("--stats-workers", type=int, default=int(defaults.get("stats_workers", 1)))
+    parser.add_argument(
+        "--disable-sampling",
+        action="store_true",
+        default=not bool(defaults.get("sampling_enabled", True)),
+    )
+    parser.add_argument("--max-paths", type=int, default=int(defaults.get("max_paths", 50_000)))
+    parser.add_argument(
+        "--max-frontier-per-start",
+        type=int,
+        default=int(defaults.get("max_frontier_per_start", 5_000)),
+    )
+    parser.add_argument(
+        "--skip-correlations",
+        action="store_true",
+        default=bool(defaults.get("skip_correlations", False)),
+    )
+    parser.add_argument(
+        "--disable-stats-checkpoint-resume",
+        action="store_true",
+        default=not bool(defaults.get("stats_checkpoint_resume", True)),
+    )
+    parser.add_argument(
+        "--use-llm-semantics",
+        action="store_true",
+        default=bool(defaults.get("use_llm_semantics", False)),
+    )
+    parser.add_argument("--llm-model-size", choices=sorted(MODEL_PATHS), default=defaults.get("llm_model_size", "8b"))
+    parser.add_argument(
+        "--use-llm-path-scoring",
+        action="store_true",
+        default=bool(defaults.get("use_llm_path_scoring", False)),
+    )
+    parser.add_argument("--llm-path-top-k", type=int, default=int(defaults.get("llm_path_top_k", 200)))
+    parser.add_argument(
+        "--compute-path-catalog",
+        action="store_true",
+        default=bool(defaults.get("compute_path_catalog", False)),
+    )
+    parser.add_argument(
+        "--llm-semantics-confidence-threshold",
+        type=float,
+        default=float(defaults.get("llm_semantics_confidence_threshold", 0.6)),
+    )
+    parser.add_argument(
+        "--disable-llm-semantics-ensemble",
+        action="store_true",
+        default=not bool(defaults.get("llm_semantics_use_ensemble", True)),
+    )
+    parser.add_argument("--histogram-bins", type=int, default=int(defaults.get("histogram_bins", 20)))
+    parser.add_argument("--categorical-topk", type=int, default=int(defaults.get("categorical_topk", 20)))
+    parser.add_argument("--random-seed", type=int, default=int(defaults.get("random_seed", 42)))
+    parser.add_argument("--artifact-version", type=str, default=str(defaults.get("artifact_version", "phase1.v2")))
+    parser.add_argument(
+        "--max-rows-exact-profile",
+        type=int,
+        default=int(defaults.get("max_rows_exact_profile", defaults.get("sampling_row_threshold", 200_000))),
+    )
+    parser.add_argument("--max-corr-columns", type=int, default=int(defaults.get("max_corr_columns", 30)))
+    parser.add_argument(
+        "--max-corr-numeric-columns",
+        type=int,
+        default=int(defaults.get("max_corr_numeric_columns", 20)),
+    )
+    parser.add_argument(
+        "--max-corr-categorical-columns",
+        type=int,
+        default=int(defaults.get("max_corr_categorical_columns", 15)),
+    )
+    parser.add_argument(
+        "--max-corr-cross-columns",
+        type=int,
+        default=int(defaults.get("max_corr_cross_columns", 15)),
+    )
+    parser.add_argument("--max-fk-pairs-exact", type=int, default=int(defaults.get("max_fk_pairs_exact", 250)))
+    parser.add_argument(
+        "--fk-overlap-sample-size",
+        type=int,
+        default=int(defaults.get("fk_overlap_sample_size", 50_000)),
+    )
+    parser.add_argument("--max-fk-null-ratio", type=float, default=float(defaults.get("max_fk_null_ratio", 0.98)))
+    parser.add_argument(
+        "--max-cardinality-for-topk",
+        type=int,
+        default=int(defaults.get("max_cardinality_for_topk", 5_000)),
+    )
+    parser.add_argument("--max-text-profile-rows", type=int, default=int(defaults.get("max_text_profile_rows", 5_000)))
+    parser.add_argument(
+        "--strict-cutoff-task-loading",
+        action="store_true",
+        default=bool(defaults.get("strict_cutoff_task_loading", True)),
+    )
     return parser
 
 
-def main() -> None:
-    args = build_arg_parser().parse_args()
-    cfg = Phase1Config(
+def _build_config_from_args(args: argparse.Namespace) -> Phase1Config:
+    return Phase1Config(
         dataset=args.dataset,
         output_dir=args.output_dir,
         max_path_depth=args.max_path_depth,
@@ -1294,6 +1329,11 @@ def main() -> None:
         sample_size=args.sample_size,
         correlation_topk_per_table=args.correlation_topk_per_table,
         correlation_global_cap=args.correlation_global_cap,
+        correlation_sample_size=args.correlation_sample_size,
+        histogram_bins=args.histogram_bins,
+        categorical_topk=args.categorical_topk,
+        random_seed=args.random_seed,
+        artifact_version=args.artifact_version,
         max_paths=args.max_paths,
         max_frontier_per_start=args.max_frontier_per_start,
         skip_correlations=args.skip_correlations,
@@ -1304,13 +1344,32 @@ def main() -> None:
         compute_path_catalog=args.compute_path_catalog or args.use_llm_path_scoring,
         llm_semantics_confidence_threshold=args.llm_semantics_confidence_threshold,
         llm_semantics_use_ensemble=not args.disable_llm_semantics_ensemble,
-        stats_workers=(
-            max(1, int(args.stats_workers))
-            if int(args.stats_workers) > 0
-            else max(1, min(8, (os.cpu_count() or 1)))
-        ),
+        stats_workers=max(1, int(args.stats_workers)),
         stats_checkpoint_resume=not args.disable_stats_checkpoint_resume,
+        max_rows_exact_profile=args.max_rows_exact_profile,
+        max_corr_columns=args.max_corr_columns,
+        max_corr_numeric_columns=args.max_corr_numeric_columns,
+        max_corr_categorical_columns=args.max_corr_categorical_columns,
+        max_corr_cross_columns=args.max_corr_cross_columns,
+        max_fk_pairs_exact=args.max_fk_pairs_exact,
+        fk_overlap_sample_size=args.fk_overlap_sample_size,
+        max_fk_null_ratio=args.max_fk_null_ratio,
+        max_cardinality_for_topk=args.max_cardinality_for_topk,
+        max_text_profile_rows=args.max_text_profile_rows,
+        strict_cutoff_task_loading=bool(args.strict_cutoff_task_loading),
     )
+
+
+def main() -> None:
+    config_probe = argparse.ArgumentParser(add_help=False)
+    config_probe.add_argument("--config", type=Path, default=None)
+    known, _ = config_probe.parse_known_args()
+    defaults: dict[str, Any] = {}
+    if known.config is not None:
+        defaults = _load_config_file(known.config)
+    parser = build_arg_parser(defaults)
+    args = parser.parse_args()
+    cfg = _build_config_from_args(args)
     pipeline = Phase1Pipeline(cfg)
     paths = pipeline.run()
     print("Phase 1 completed. Artifacts:")
