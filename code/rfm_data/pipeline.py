@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 import json
 from pathlib import Path
 from typing import Any
@@ -98,13 +98,71 @@ class RelBenchDuckDBPipeline:
             }
         return out
 
+    def _table_info_needs_bootstrap(self, conn: duckdb.DuckDBPyConnection) -> bool:
+        expected_tables = len(self._iter_parquet_paths())
+        try:
+            exists = conn.execute(
+                "select count(*) from information_schema.tables "
+                "where table_schema = 'relbench_meta' and table_name = 'table_info'"
+            ).fetchone()
+            if not exists or int(exists[0]) == 0:
+                return True
+            row_count = conn.execute("select count(*) from relbench_meta.table_info").fetchone()
+            if not row_count:
+                return True
+            return int(row_count[0]) != expected_tables
+        except Exception:
+            return True
+
+    def _build_table_info_rows(self) -> list[tuple[Any, ...]]:
+        db = self.materialize()
+        rows: list[tuple[Any, ...]] = []
+        for name, table in db.table_dict.items():
+            rows.append(
+                (
+                    name,
+                    str(self.config.parquet_dir / f"{name}.parquet"),
+                    len(table.df),
+                    len(table.df.columns),
+                    table.pkey_col,
+                    table.time_col,
+                    json.dumps(dict(table.fkey_col_to_pkey_table or {}), sort_keys=True),
+                )
+            )
+        return rows
+
+    def _ensure_persisted_table_info(self, conn: duckdb.DuckDBPyConnection) -> None:
+        if not self._table_info_needs_bootstrap(conn):
+            return
+        rows = self._build_table_info_rows()
+        conn.execute("drop table if exists relbench_meta.table_info")
+        conn.execute(
+            """
+            create table relbench_meta.table_info (
+                table_name varchar,
+                parquet_path varchar,
+                num_rows bigint,
+                num_columns integer,
+                primary_key varchar,
+                time_column varchar,
+                foreign_keys json
+            )
+            """
+        )
+        if rows:
+            conn.executemany(
+                """
+                insert into relbench_meta.table_info
+                values (?, ?, ?, ?, ?, ?, ?)
+                """,
+                rows,
+            )
+
     def list_tables(self) -> list[TableInfo]:
         self._ensure_dataset_cache_dir()
         tables: list[TableInfo] = []
-        metadata_by_table: dict[str, dict[str, Any]] = {}
-        if Path(self.config.duckdb_path).exists():
-            with duckdb.connect(str(self.config.duckdb_path), read_only=True) as conn:
-                metadata_by_table = self._load_persisted_table_info(conn)
+        with self.connect(read_only=False) as conn:
+            metadata_by_table = self._load_persisted_table_info(conn)
 
         with duckdb.connect(database=":memory:") as scratch:
             for parquet_path in self._iter_parquet_paths():
@@ -162,6 +220,7 @@ class RelBenchDuckDBPipeline:
                 select * from read_parquet('{parquet_path_str}');
                 """
             )
+        self._ensure_persisted_table_info(conn)
 
     def query(self, sql: str) -> Any:
         with self.connect(read_only=False) as conn:

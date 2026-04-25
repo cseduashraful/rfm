@@ -22,7 +22,6 @@ from phase1_utils import (
     is_temporal_dtype_name,
     normalize_identifier_tokens,
     quote_ident,
-    quote_qualified,
     singularize_identifier,
     sql_str_literal,
     sql_timestamp_literal,
@@ -210,23 +209,7 @@ class Phase1DataAccess:
         }
 
     def _register_views(self) -> None:
-        self.conn.execute("CREATE SCHEMA IF NOT EXISTS relbench")
-        self.conn.execute("CREATE SCHEMA IF NOT EXISTS relbench_meta")
-        if not self.parquet_dir.exists():
-            raise FileNotFoundError(
-                f"Expected parquet directory for dataset={self.dataset_name} at {self.parquet_dir}"
-            )
-        for parquet_path in sorted(self.parquet_dir.glob("*.parquet")):
-            table_name = parquet_path.stem
-            path_literal = sql_str_literal(parquet_path.as_posix())
-            table_ident = quote_ident(table_name)
-            relbench_ident = quote_qualified("relbench", table_name)
-            self.conn.execute(
-                f"CREATE OR REPLACE VIEW {table_ident} AS SELECT * FROM read_parquet({path_literal})"
-            )
-            self.conn.execute(
-                f"CREATE OR REPLACE VIEW {relbench_ident} AS SELECT * FROM read_parquet({path_literal})"
-            )
+        self.pipeline._register_views(self.conn)
 
     def _build_metadata(self) -> dict[str, TableMetadata]:
         persisted = self._load_persisted_metadata_rows()
@@ -268,14 +251,27 @@ class Phase1DataAccess:
     ) -> TableMetadata:
         warnings: list[str] = []
         lower_to_actual = {col.lower(): col for col in columns}
+        compact_to_actual = {self._compact_identifier(col): col for col in columns}
         detected_time_columns = [
             col
             for col in columns
             if is_temporal_dtype_name(dtypes.get(col, "")) or self._looks_like_time_name(col)
         ]
-        provided_pk = self._normalized_persisted_column(lower_to_actual, persisted_row.get("primary_key"))
-        persisted_time = self._normalized_persisted_column(lower_to_actual, persisted_row.get("time_column"))
-        provided_fks = self._normalized_foreign_keys(lower_to_actual, persisted_row.get("foreign_keys", {}))
+        provided_pk = self._normalized_persisted_column(
+            lower_to_actual,
+            compact_to_actual,
+            persisted_row.get("primary_key"),
+        )
+        persisted_time = self._normalized_persisted_column(
+            lower_to_actual,
+            compact_to_actual,
+            persisted_row.get("time_column"),
+        )
+        provided_fks = self._normalized_foreign_keys(
+            lower_to_actual,
+            compact_to_actual,
+            persisted_row.get("foreign_keys", {}),
+        )
 
         time_column = persisted_time
         metadata_source = "relbench_meta_table_info" if persisted_row else "heuristic"
@@ -347,22 +343,43 @@ class Phase1DataAccess:
 
     def _guess_primary_key(self, table_name: str, columns: list[str]) -> str | None:
         lower_to_actual = {col.lower(): col for col in columns}
+        compact_to_actual = {self._compact_identifier(col): col for col in columns}
         singular = singularize_identifier(table_name)
         candidates = [
             "id",
+            table_name.lower(),
+            singular,
             f"{table_name.lower()}_id",
             f"{singular}_id",
-            singular,
+            f"{table_name.lower()}id",
+            f"{singular}id",
         ]
         for candidate in candidates:
             actual = lower_to_actual.get(candidate)
             if actual is not None:
                 return actual
+            compact_actual = compact_to_actual.get(self._compact_identifier(candidate))
+            if compact_actual is not None:
+                return compact_actual
+        compact_table = self._compact_identifier(table_name)
+        compact_singular = self._compact_identifier(singular)
+        id_like = [col for col in columns if self._compact_identifier(col).endswith("id")]
+        scoped = [
+            col
+            for col in id_like
+            if self._compact_identifier(col).startswith(compact_table)
+            or self._compact_identifier(col).startswith(compact_singular)
+        ]
+        if len(scoped) == 1:
+            return scoped[0]
+        if len(id_like) == 1:
+            return id_like[0]
         return None
 
     def _normalized_persisted_column(
         self,
         lower_to_actual: dict[str, str],
+        compact_to_actual: dict[str, str],
         candidate: Any,
     ) -> str | None:
         if candidate is None:
@@ -372,22 +389,29 @@ class Phase1DataAccess:
             return None
         if candidate_s in lower_to_actual.values():
             return candidate_s
-        return lower_to_actual.get(candidate_s.lower())
+        actual = lower_to_actual.get(candidate_s.lower())
+        if actual is not None:
+            return actual
+        return compact_to_actual.get(self._compact_identifier(candidate_s))
 
     def _normalized_foreign_keys(
         self,
         lower_to_actual: dict[str, str],
+        compact_to_actual: dict[str, str],
         payload: Any,
     ) -> dict[str, str]:
         if not isinstance(payload, dict):
             return {}
         out: dict[str, str] = {}
         for key, value in payload.items():
-            actual_key = self._normalized_persisted_column(lower_to_actual, key)
+            actual_key = self._normalized_persisted_column(lower_to_actual, compact_to_actual, key)
             if actual_key is None:
                 continue
             out[actual_key] = str(value)
         return out
+
+    def _compact_identifier(self, name: str) -> str:
+        return "".join(ch.lower() for ch in str(name) if ch.isalnum())
 
     def _looks_like_time_name(self, column_name: str) -> bool:
         toks = normalize_identifier_tokens(column_name)
