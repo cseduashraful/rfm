@@ -32,7 +32,10 @@ python RFM/v2/phase3/phase3_pipeline.py \
 ## Design
 
 - Uses test split rows as query items.
-- For each query timestamp, only same-entity history rows with `timestamp < query_timestamp` are included.
+- For each query timestamp, same-entity self history is leakage-safe:
+  - If the task defines a prediction horizon (`task_object.timedelta`), only rows with
+    `timestamp <= query_timestamp - horizon` are included.
+  - Otherwise fallback is `timestamp < query_timestamp`.
 - Prompt mode is DFS-table only (`include_neighbors=False`, `include_dfs_summary=False`, `include_dfs_table=True`).
 - FastDFS feature dicts are filtered using Phase 2 outputs:
   - `task_spec.json` (`attribute_aggregation_plan`)
@@ -44,4 +47,3 @@ Per dataset/task under `<output-dir>/<dataset>/<task>/`:
 
 - `phase3_summary.json`
 - `phase3_predictions.json`
-

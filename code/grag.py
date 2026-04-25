@@ -1,4 +1,5 @@
 from dataclasses import dataclass, field
+from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, List, Tuple, Optional, Any, Iterable
 from collections import defaultdict
 import csv
@@ -1260,7 +1261,6 @@ def build_zero_shot_prompt(
     other_neighbor_entity_count=5,
     other_neighbor_history_count=3,
 ):
-    _ = context_workers
     table_only_mode = include_dfs_table and not include_neighbors and not include_dfs_summary
 
     def _visible_row_fields(row: Dict[str, Any]) -> Dict[str, Any]:
@@ -1287,24 +1287,35 @@ def build_zero_shot_prompt(
                 entry_dfs_feature_dicts = dfs_context_builder.feature_dicts_for_rows(entry_rows)
 
     entry_contexts = []
-    for row, dfs_summary in zip(entry_rows, entry_dfs_summaries):
-        entity_value = row[resource.entity_col]
-        cutoff_time = pd.Timestamp(row[resource.time_col])
-        node_id = store.node_id_map.get((resource.entity_table, entity_value))
-        if node_id is None:
-            continue
+    if not table_only_mode:
+        def _build_entry_context(row: Dict[str, Any], dfs_summary: list[str]) -> dict[str, Any] | None:
+            entity_value = row[resource.entity_col]
+            cutoff_time = pd.Timestamp(row[resource.time_col])
+            node_id = store.node_id_map.get((resource.entity_table, entity_value))
+            if node_id is None:
+                return None
+            context = build_semantic_context(
+                store=store,
+                extractor=extractor,
+                node_id=node_id,
+                cutoff_time=cutoff_time,
+                k_hist=len(history_rows) if history_rows else top_k,
+                top_k=top_k,
+                num_hops=num_hops,
+                include_semantic_retrieval=include_semantic_retrieval,
+            )
+            return {"row": row, "context": context, "dfs_summary": dfs_summary}
 
-        context = build_semantic_context(
-            store=store,
-            extractor=extractor,
-            node_id=node_id,
-            cutoff_time=cutoff_time,
-            k_hist=len(history_rows) if history_rows else top_k,
-            top_k=top_k,
-            num_hops=num_hops,
-            include_semantic_retrieval=include_semantic_retrieval,
-        )
-        entry_contexts.append({"row": row, "context": context, "dfs_summary": dfs_summary})
+        max_workers = max(1, int(context_workers))
+        if max_workers > 1 and len(entry_rows) > 1:
+            with ThreadPoolExecutor(max_workers=min(max_workers, len(entry_rows))) as pool:
+                built_contexts = list(pool.map(_build_entry_context, entry_rows, entry_dfs_summaries))
+            entry_contexts = [ctx for ctx in built_contexts if ctx is not None]
+        else:
+            for row, dfs_summary in zip(entry_rows, entry_dfs_summaries):
+                built = _build_entry_context(row, dfs_summary)
+                if built is not None:
+                    entry_contexts.append(built)
 
     lines = []
 

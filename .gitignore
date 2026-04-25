@@ -28,6 +28,7 @@ artifacts/
 v2/phase1/artifacts/
 v2/phase2/artifacts/
 v2/phase3/artifacts/
+v2/phase2/profile_runs/
 
 # LaTeX build outputs
 *.aux

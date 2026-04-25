@@ -5,8 +5,14 @@ import copy
 import math
 import re
 import sys
+import time
+import warnings
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+import numpy as np
+import pandas as pd
 
 # Ensure imports from RFM/code and local phase2 modules.
 _RFM_ROOT = Path(__file__).resolve().parents[2]
@@ -30,6 +36,514 @@ from phase2_policy import (
     sanitize_selected_paths,
 )
 from phase2_rescoring import llm_rescore_candidate_paths
+
+try:
+    from tqdm.auto import tqdm  # type: ignore
+except Exception:  # pragma: no cover
+    tqdm = None
+
+
+@dataclass
+class Phase2DFSFeaturePolicy:
+    allowed_table_column_pairs: set[tuple[str, str]]
+    allowed_aggs: set[str]
+    max_features: int = 256
+
+
+def _normalize_identifier(text: Any) -> str:
+    return str(text or "").strip().lower()
+
+
+def _normalize_agg(text: Any) -> str:
+    t = _normalize_identifier(text)
+    if t in {"avg"}:
+        return "mean"
+    return t
+
+
+def _build_phase2_dfs_feature_policy(task_spec: dict[str, Any]) -> Phase2DFSFeaturePolicy:
+    allowed_pairs: set[tuple[str, str]] = set()
+    allowed_aggs: set[str] = set()
+
+    attr_plan = task_spec.get("attribute_aggregation_plan", [])
+    if isinstance(attr_plan, dict):
+        attr_plan = attr_plan.get("per_path", [])
+
+    if isinstance(attr_plan, list):
+        for entry in attr_plan:
+            if not isinstance(entry, dict):
+                continue
+            attrs = entry.get("priority_attributes", [])
+            if not isinstance(attrs, list):
+                continue
+            for attr in attrs:
+                if not isinstance(attr, dict):
+                    continue
+                table_name = _normalize_identifier(attr.get("table"))
+                col_name = _normalize_identifier(attr.get("column"))
+                if table_name and col_name:
+                    allowed_pairs.add((table_name, col_name))
+                aggs = attr.get("suggested_aggregations", [])
+                if isinstance(aggs, list):
+                    for agg in aggs:
+                        agg_n = _normalize_agg(agg)
+                        if agg_n:
+                            allowed_aggs.add(agg_n)
+
+    if not allowed_aggs:
+        allowed_aggs = {"count", "mean", "std", "sum", "min", "max"}
+
+    return Phase2DFSFeaturePolicy(
+        allowed_table_column_pairs=allowed_pairs,
+        allowed_aggs=allowed_aggs,
+        max_features=256,
+    )
+
+
+def _phase2_dfs_feature_policy_score(feature_name: str, policy: Phase2DFSFeaturePolicy) -> int:
+    lowered = feature_name.lower()
+    score = 0
+
+    agg_match = re.search(r"\.([a-z_]+)\(", lowered)
+    agg = _normalize_agg(agg_match.group(1)) if agg_match else ""
+    if agg and agg in policy.allowed_aggs:
+        score += 2
+
+    allowed_tables = {t for t, _ in policy.allowed_table_column_pairs}
+    for table_name, col_name in policy.allowed_table_column_pairs:
+        if f"({table_name}.{col_name})" in lowered:
+            score += 4
+            break
+    else:
+        for table_name in allowed_tables:
+            if f"({table_name})" in lowered or f"({table_name}." in lowered:
+                score += 1
+                break
+
+    return score
+
+
+class Phase2AwareFastDFSBuilder:
+    def __init__(self, base_builder: Any, policy: Phase2DFSFeaturePolicy):
+        self._base = base_builder
+        self._policy = policy
+
+    def summarize_rows(self, rows: list[dict[str, Any]]) -> list[list[str]]:
+        return self._base.summarize_rows(rows)
+
+    def feature_dicts_for_rows(self, rows: list[dict[str, Any]]) -> list[dict[str, str]]:
+        raw = self._base.feature_dicts_for_rows(rows)
+        filtered_rows: list[dict[str, str]] = []
+        for row_dict in raw:
+            if not isinstance(row_dict, dict):
+                filtered_rows.append({})
+                continue
+            ranked_items = sorted(
+                row_dict.items(),
+                key=lambda kv: (
+                    -_phase2_dfs_feature_policy_score(str(kv[0]), self._policy),
+                    str(kv[0]),
+                ),
+            )
+            filtered_rows.append(dict(ranked_items[: self._policy.max_features]))
+        return filtered_rows
+
+
+def _numeric_feature_map(feature_dict: dict[str, Any]) -> dict[str, float]:
+    out: dict[str, float] = {}
+    for k, v in feature_dict.items():
+        try:
+            fv = float(v)
+        except Exception:
+            continue
+        if np.isnan(fv) or np.isinf(fv):
+            continue
+        out[str(k)] = fv
+    return out
+
+
+def _build_phase2_train_vector_db_config(dataset: str, task: str) -> dict[str, Any]:
+    return {
+        "name": "phase2_train_vector_db",
+        "batch_size": 1,
+        "history_length": 10,
+        "history_source": "dataset",
+        "history_sampling_strategy": "most_recent_k",
+        "history_parallel_mode": "grouped_vectorized",
+        "history_parallel_workers": 4,
+        "cache_dataset_history_labels": True,
+        "cache_train_history_candidates": True,
+        "include_future_rows": True,
+        "dataset_download": True,
+        "task_download": True,
+        "datasets": [{"name": dataset, "tasks": [task]}],
+    }
+
+
+def _phase2_dfs_max_depth_from_task_spec(task_spec: dict[str, Any]) -> int:
+    depth_policy = task_spec.get("depth_policy", {})
+    if not isinstance(depth_policy, dict):
+        return 2
+
+    default_depth = depth_policy.get("default_max_depth", 2)
+    max_allowed = depth_policy.get("max_allowed_depth", None)
+
+    try:
+        chosen = int(default_depth)
+    except Exception:
+        chosen = 2
+    if chosen < 1:
+        chosen = 1
+
+    if max_allowed is not None:
+        try:
+            max_allowed_i = int(max_allowed)
+            if max_allowed_i >= 1:
+                chosen = min(chosen, max_allowed_i)
+        except Exception:
+            pass
+    return chosen
+
+
+def _phase2_dfs_prune_plan_from_task_spec(
+    task_spec: dict[str, Any],
+) -> tuple[set[str] | None, dict[str, set[str]] | None]:
+    attr_plan = task_spec.get("attribute_aggregation_plan", [])
+    if not isinstance(attr_plan, list) or not attr_plan:
+        return None, None
+
+    task_def = task_spec.get("task_definition", {})
+    entity_table = _normalize_identifier(task_def.get("entity_table"))
+    entity_col = _normalize_identifier(task_def.get("entity_col"))
+    time_col = _normalize_identifier(task_def.get("time_col"))
+    output_col = _normalize_identifier(task_def.get("output_col"))
+
+    include_tables: set[str] = set()
+    include_cols: dict[str, set[str]] = {}
+
+    def _add_col(table_name: str, col_name: str) -> None:
+        if not table_name or not col_name:
+            return
+        include_tables.add(table_name)
+        include_cols.setdefault(table_name, set()).add(col_name)
+
+    for entry in attr_plan:
+        if not isinstance(entry, dict):
+            continue
+        path_tables = entry.get("path_tables", [])
+        if isinstance(path_tables, list):
+            for t in path_tables:
+                tname = _normalize_identifier(t)
+                if tname:
+                    include_tables.add(tname)
+        attrs = entry.get("priority_attributes", [])
+        if not isinstance(attrs, list):
+            continue
+        for attr in attrs:
+            if not isinstance(attr, dict):
+                continue
+            _add_col(
+                _normalize_identifier(attr.get("table")),
+                _normalize_identifier(attr.get("column")),
+            )
+
+    if entity_table:
+        include_tables.add(entity_table)
+        _add_col(entity_table, entity_col)
+        _add_col(entity_table, time_col)
+        _add_col(entity_table, output_col)
+
+    if not include_tables:
+        return None, None
+    return include_tables, include_cols
+
+
+def _build_train_dfs_vector_db(
+    *,
+    dataset: str,
+    task: str,
+    task_obj: Any,
+    task_spec: dict[str, Any],
+    output_dir: Path,
+    batch_size: int = 64,
+    max_vocab: int = 4096,
+    profile_enabled: bool = False,
+    profile_chunks: int = 8,
+    profile_early_stop: bool = False,
+    prune_schema_from_task_spec: bool = False,
+) -> dict[str, Any]:
+    from fastdfs_context import build_fastdfs_context_builder  # type: ignore
+    from inference_history import build_inference_resource  # type: ignore
+
+    task_def = task_spec.get("task_definition", {})
+    entity_col = str(task_def.get("entity_col", ""))
+    time_col = str(task_def.get("time_col", ""))
+    output_col = str(task_def.get("output_col", ""))
+
+    train_table = task_obj.get_table("train", mask_input_cols=False)
+    train_df = train_table.df.copy().reset_index(drop=True)
+    if train_df.empty:
+        db_dir = output_dir / "dfs_train_vector_db"
+        db_dir.mkdir(parents=True, exist_ok=True)
+        summary = {
+            "enabled": True,
+            "status": "empty_train_split",
+            "rows": 0,
+            "vector_dim": 0,
+            "batch_size": int(batch_size),
+            "max_vocab": int(max_vocab),
+            "artifact_dir": str(db_dir.resolve()),
+        }
+        write_json(db_dir / "manifest.json", summary)
+        return summary
+
+    resource = build_inference_resource(_build_phase2_train_vector_db_config(dataset, task))
+    policy = _build_phase2_dfs_feature_policy(task_spec)
+    dfs_max_depth = _phase2_dfs_max_depth_from_task_spec(task_spec)
+    include_tables, include_table_columns = (None, None)
+    if prune_schema_from_task_spec:
+        include_tables, include_table_columns = _phase2_dfs_prune_plan_from_task_spec(task_spec)
+    engine_path = output_dir / f"phase2_fastdfs_train_{dataset}_{task}.db"
+    base_dfs_builder = build_fastdfs_context_builder(
+        resource,
+        max_depth=dfs_max_depth,
+        engine_path=str(engine_path),
+        include_tables=include_tables,
+        include_table_columns=include_table_columns,
+    )
+    dfs_builder = Phase2AwareFastDFSBuilder(base_dfs_builder, policy)
+
+    rows = train_df.to_dict(orient="records")
+    row_feature_maps: list[dict[str, float]] = []
+    feature_counts: dict[str, int] = {}
+    bs = max(1, int(batch_size))
+    profiling_rows: list[dict[str, Any]] = []
+    prof_limit = max(0, int(profile_chunks))
+    t_build_start = time.perf_counter()
+    total_dfs_seconds = 0.0
+    total_map_seconds = 0.0
+    processed_rows = 0
+    processed_chunks = 0
+    total_chunks = (len(rows) + bs - 1) // bs
+    chunk_starts: Any = range(0, len(rows), bs)
+    if tqdm is not None:
+        chunk_starts = tqdm(
+            chunk_starts,
+            total=total_chunks,
+            desc="[phase2] DFS train vector DB",
+            unit="chunk",
+        )
+    for chunk_idx, start in enumerate(chunk_starts):
+        chunk = rows[start : start + bs]
+        t0 = time.perf_counter()
+        feature_dicts = dfs_builder.feature_dicts_for_rows([dict(r) for r in chunk])
+        t1 = time.perf_counter()
+        map_start = time.perf_counter()
+        for fdict in feature_dicts:
+            fmap = _numeric_feature_map(fdict if isinstance(fdict, dict) else {})
+            row_feature_maps.append(fmap)
+            for key in fmap:
+                feature_counts[key] = feature_counts.get(key, 0) + 1
+        t2 = time.perf_counter()
+        dfs_s = t1 - t0
+        map_s = t2 - map_start
+        total_dfs_seconds += dfs_s
+        total_map_seconds += map_s
+        processed_rows += len(chunk)
+        processed_chunks += 1
+        if profile_enabled and len(profiling_rows) < prof_limit:
+            profiling_rows.append(
+                {
+                    "chunk_index": int(chunk_idx),
+                    "rows_in_chunk": int(len(chunk)),
+                    "dfs_seconds": float(dfs_s),
+                    "numeric_map_seconds": float(map_s),
+                    "total_chunk_seconds": float(t2 - t0),
+                    "rows_per_second": float(len(chunk) / max(1e-9, (t2 - t0))),
+                }
+            )
+        if profile_enabled and profile_early_stop and prof_limit > 0 and len(profiling_rows) >= prof_limit:
+            print(
+                "[phase2][profile] early stop after "
+                f"{processed_chunks} chunks ({processed_rows} rows sampled)"
+            )
+            break
+
+    if profile_enabled and profile_early_stop and processed_rows < len(rows):
+        db_dir = output_dir / "dfs_train_vector_db"
+        db_dir.mkdir(parents=True, exist_ok=True)
+        profile_payload = {
+            "dataset": dataset,
+            "task": task,
+            "rows_profiled": int(sum(int(x["rows_in_chunk"]) for x in profiling_rows)),
+            "chunks_profiled": int(len(profiling_rows)),
+            "profile_chunk_limit": int(prof_limit),
+            "batch_size": int(bs),
+            "notes": (
+                "Sampled profiling rows from early chunks only. "
+                "Early-stop mode skipped full DFS train vector DB materialization."
+            ),
+            "chunk_profiles": profiling_rows,
+        }
+        profile_path = db_dir / "profile_sample.json"
+        write_json(profile_path, profile_payload)
+        summary = {
+            "enabled": True,
+            "status": "profile_early_stop",
+            "rows": int(processed_rows),
+            "rows_total_train": int(len(rows)),
+            "vector_dim": 0,
+            "batch_size": int(bs),
+            "max_vocab": int(max_vocab),
+            "policy_max_features_per_row": int(policy.max_features),
+            "policy_dfs_max_depth": int(dfs_max_depth),
+            "schema_pruning_enabled": bool(prune_schema_from_task_spec),
+            "schema_pruning_tables_kept": (
+                int(len(include_tables)) if include_tables is not None else None
+            ),
+            "policy_allowed_table_column_pairs": int(len(policy.allowed_table_column_pairs)),
+            "policy_allowed_aggs": sorted(policy.allowed_aggs),
+            "artifact_dir": str(db_dir.resolve()),
+            "timing": {
+                "build_total_seconds": float(time.perf_counter() - t_build_start),
+                "dfs_feature_generation_seconds": float(total_dfs_seconds),
+                "numeric_map_seconds": float(total_map_seconds),
+                "processed_rows": int(processed_rows),
+                "processed_chunks": int(processed_chunks),
+                "avg_rows_per_second": float(
+                    processed_rows / max(1e-9, total_dfs_seconds + total_map_seconds)
+                ),
+            },
+            "profiling": {
+                "enabled": True,
+                "early_stop": True,
+                "profile_sample_path": str(profile_path.resolve()),
+                "chunks_profiled": int(len(profiling_rows)),
+            },
+        }
+        write_json(db_dir / "manifest.json", summary)
+        try:
+            engine_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        return summary
+
+    ranked_features = sorted(
+        feature_counts.items(),
+        key=lambda kv: (-kv[1], kv[0]),
+    )
+    if int(max_vocab) > 0:
+        ranked_features = ranked_features[: int(max_vocab)]
+    feature_vocab = [k for k, _ in ranked_features]
+    feature_to_idx = {k: i for i, k in enumerate(feature_vocab)}
+
+    n_rows = len(row_feature_maps)
+    vectors = np.zeros((n_rows, len(feature_vocab)), dtype=np.float32)
+    for i, fmap in enumerate(row_feature_maps):
+        for key, value in fmap.items():
+            j = feature_to_idx.get(key)
+            if j is not None:
+                vectors[i, j] = np.float32(value)
+    norms = np.linalg.norm(vectors, axis=1).astype(np.float32)
+
+    db_dir = output_dir / "dfs_train_vector_db"
+    db_dir.mkdir(parents=True, exist_ok=True)
+    np.save(db_dir / "vectors.npy", vectors)
+    np.save(db_dir / "norms.npy", norms)
+    write_json(
+        db_dir / "feature_vocab.json",
+        {"features": feature_vocab},
+    )
+
+    meta_df = pd.DataFrame(
+        {
+            "row_index": np.arange(len(train_df), dtype=np.int64),
+            "entity": (
+                train_df[entity_col].map(lambda x: "" if pd.isna(x) else str(x))
+                if entity_col in train_df.columns
+                else pd.Series([""] * len(train_df))
+            ),
+            "time": (
+                pd.to_datetime(train_df[time_col], errors="coerce")
+                .map(lambda x: "" if pd.isna(x) else str(pd.Timestamp(x)))
+                if time_col in train_df.columns
+                else pd.Series([""] * len(train_df))
+            ),
+            "target": (
+                train_df[output_col].map(lambda x: "" if pd.isna(x) else str(x))
+                if output_col in train_df.columns
+                else pd.Series([""] * len(train_df))
+            ),
+        }
+    )
+    meta_df.to_csv(db_dir / "row_meta.csv", index=False)
+
+    summary = {
+        "enabled": True,
+        "status": "ok",
+        "rows": int(vectors.shape[0]),
+        "vector_dim": int(vectors.shape[1]),
+        "nonzero_vectors": int(np.count_nonzero(norms)),
+        "batch_size": int(bs),
+        "max_vocab": int(max_vocab),
+        "policy_max_features_per_row": int(policy.max_features),
+        "policy_dfs_max_depth": int(dfs_max_depth),
+        "schema_pruning_enabled": bool(prune_schema_from_task_spec),
+        "schema_pruning_tables_kept": int(len(include_tables)) if include_tables is not None else None,
+        "policy_allowed_table_column_pairs": int(len(policy.allowed_table_column_pairs)),
+        "policy_allowed_aggs": sorted(policy.allowed_aggs),
+        "artifact_dir": str(db_dir.resolve()),
+        "artifacts": {
+            "vectors_npy": str((db_dir / "vectors.npy").resolve()),
+            "norms_npy": str((db_dir / "norms.npy").resolve()),
+            "feature_vocab_json": str((db_dir / "feature_vocab.json").resolve()),
+            "row_meta_csv": str((db_dir / "row_meta.csv").resolve()),
+        },
+        "timing": {
+            "build_total_seconds": float(time.perf_counter() - t_build_start),
+            "dfs_feature_generation_seconds": float(total_dfs_seconds),
+            "numeric_map_seconds": float(total_map_seconds),
+            "processed_rows": int(processed_rows),
+            "processed_chunks": int(processed_chunks),
+            "avg_rows_per_second": float(
+                processed_rows / max(1e-9, total_dfs_seconds + total_map_seconds)
+            ),
+        },
+    }
+    if profile_enabled and prof_limit > 0:
+        profile_payload = {
+            "dataset": dataset,
+            "task": task,
+            "rows_profiled": int(sum(int(x["rows_in_chunk"]) for x in profiling_rows)),
+            "chunks_profiled": int(len(profiling_rows)),
+            "profile_chunk_limit": int(prof_limit),
+            "batch_size": int(bs),
+            "notes": (
+                "Sampled profiling rows from early chunks only. "
+                "Full-train per-row traces are intentionally disabled."
+            ),
+            "chunk_profiles": profiling_rows,
+        }
+        profile_path = db_dir / "profile_sample.json"
+        write_json(profile_path, profile_payload)
+        summary["profiling"] = {
+            "enabled": True,
+            "profile_sample_path": str(profile_path.resolve()),
+            "chunks_profiled": int(len(profiling_rows)),
+        }
+    else:
+        summary["profiling"] = {
+            "enabled": False,
+            "chunks_profiled": 0,
+        }
+    write_json(db_dir / "manifest.json", summary)
+
+    try:
+        engine_path.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+    return summary
 
 
 def _json_safe(obj: Any) -> Any:
@@ -1118,11 +1632,25 @@ def compile_task_spec(args: argparse.Namespace) -> dict[str, Any]:
         get_task_history_feature_hints = None
 
     phase1_dir = Path(args.phase1_artifacts_dir)
+    # Reduce noisy non-fatal warnings from featuretools/woodwork during repeated DFS calls.
+    warnings.filterwarnings(
+        "ignore",
+        message="Could not infer format, so each element will be parsed individually",
+        category=UserWarning,
+    )
+    warnings.filterwarnings(
+        "ignore",
+        message="Logical type Integer for child column .* does not match parent column .*",
+        category=UserWarning,
+    )
     if not phase1_dir.exists():
         alt = _RFM_ROOT / phase1_dir
         if alt.exists():
             phase1_dir = alt
-    output_dir = Path(args.output_dir) / args.dataset / args.task
+    if args.task_output_dir is not None:
+        output_dir = Path(args.task_output_dir)
+    else:
+        output_dir = Path(args.output_dir) / args.dataset / args.task
     output_dir.mkdir(parents=True, exist_ok=True)
 
     bundle = load_phase1_bundle(phase1_dir, args.dataset)
@@ -1425,6 +1953,33 @@ def compile_task_spec(args: argparse.Namespace) -> dict[str, Any]:
         "consistency_checks": consistency_issues,
         "warnings": all_issues,
     }
+    if args.build_dfs_train_vector_db:
+        print("[phase2] building train DFS vector DB artifact...")
+        db_summary = _build_train_dfs_vector_db(
+            dataset=args.dataset,
+            task=args.task,
+            task_obj=task_obj,
+            task_spec=task_spec,
+            output_dir=output_dir,
+            batch_size=max(1, int(args.dfs_train_vector_db_batch_size)),
+            max_vocab=max(0, int(args.dfs_train_vector_db_max_vocab)),
+            profile_enabled=bool(args.profile_dfs_train_vector_db),
+            profile_chunks=max(0, int(args.profile_dfs_train_vector_db_chunks)),
+            profile_early_stop=bool(args.profile_dfs_train_vector_db_early_stop),
+            prune_schema_from_task_spec=bool(args.dfs_train_vector_db_prune_schema),
+        )
+        task_spec["dfs_train_vector_db"] = db_summary
+        print(
+            "[phase2] train DFS vector DB:"
+            f" status={db_summary.get('status')}"
+            f" rows={db_summary.get('rows', 0)}"
+            f" dim={db_summary.get('vector_dim', 0)}"
+        )
+    else:
+        task_spec["dfs_train_vector_db"] = {
+            "enabled": False,
+            "status": "disabled_by_flag",
+        }
 
     write_json(output_dir / "task_spec.json", task_spec)
     write_json(
@@ -1458,6 +2013,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--task", type=str, required=True)
     parser.add_argument("--phase1-artifacts-dir", type=Path, default=Path("RFM/v2/phase1/artifacts"))
     parser.add_argument("--output-dir", type=Path, default=Path("RFM/v2/phase2/artifacts"))
+    parser.add_argument(
+        "--task-output-dir",
+        type=Path,
+        default=None,
+        help=(
+            "If provided, write this task's outputs directly to this exact directory "
+            "(no automatic /<dataset>/<task> suffix)."
+        ),
+    )
     parser.add_argument("--model-size", type=str, default="8b")
     parser.add_argument("--max-rounds", type=int, default=3)
     parser.add_argument("--self-history-budget", type=int, default=10)
@@ -1466,6 +2030,56 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--neighbor-budget", type=int, default=10)
     parser.add_argument("--llm-path-score-max-candidates", type=int, default=220)
     parser.add_argument("--llm-path-score-batch-size", type=int, default=20)
+    parser.add_argument(
+        "--build-dfs-train-vector-db",
+        dest="build_dfs_train_vector_db",
+        action="store_true",
+        help="Build train-split DFS feature vector DB artifact for fast retrieval in inference.",
+    )
+    parser.add_argument(
+        "--no-build-dfs-train-vector-db",
+        dest="build_dfs_train_vector_db",
+        action="store_false",
+        help="Disable building train-split DFS feature vector DB artifact.",
+    )
+    parser.set_defaults(build_dfs_train_vector_db=True)
+    parser.add_argument("--dfs-train-vector-db-batch-size", type=int, default=64)
+    parser.add_argument(
+        "--dfs-train-vector-db-max-vocab",
+        type=int,
+        default=4096,
+        help="Maximum DFS feature vocabulary size for vector DB (0 means all).",
+    )
+    parser.add_argument(
+        "--profile-dfs-train-vector-db",
+        action="store_true",
+        help=(
+            "Write sampled per-chunk timing profile for train DFS vector DB build "
+            "(compact JSON, not full-train traces)."
+        ),
+    )
+    parser.add_argument(
+        "--profile-dfs-train-vector-db-chunks",
+        type=int,
+        default=8,
+        help="Number of initial chunks to sample in DFS vector DB profiling.",
+    )
+    parser.add_argument(
+        "--profile-dfs-train-vector-db-early-stop",
+        action="store_true",
+        help=(
+            "With --profile-dfs-train-vector-db enabled, stop DFS train vector DB build "
+            "after sampled profile chunks instead of processing full train split."
+        ),
+    )
+    parser.add_argument(
+        "--dfs-train-vector-db-prune-schema",
+        action="store_true",
+        help=(
+            "Conservatively prune DFS schema to task-spec path/attribute tables+columns "
+            "before building train vector DB."
+        ),
+    )
     parser.add_argument("--dry-run", action="store_true")
     return parser
 
@@ -1474,6 +2088,16 @@ def main() -> None:
     args = build_arg_parser().parse_args()
     if args.max_rounds < 1:
         raise ValueError("--max-rounds must be >= 1")
+    if args.dfs_train_vector_db_batch_size < 1:
+        raise ValueError("--dfs-train-vector-db-batch-size must be >= 1")
+    if args.dfs_train_vector_db_max_vocab < 0:
+        raise ValueError("--dfs-train-vector-db-max-vocab must be >= 0")
+    if args.profile_dfs_train_vector_db_chunks < 0:
+        raise ValueError("--profile-dfs-train-vector-db-chunks must be >= 0")
+    if args.profile_dfs_train_vector_db_early_stop and not args.profile_dfs_train_vector_db:
+        raise ValueError(
+            "--profile-dfs-train-vector-db-early-stop requires --profile-dfs-train-vector-db"
+        )
     if args.dry_run:
         print("[phase2] dry run requested; exiting before compile.")
         return

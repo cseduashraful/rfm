@@ -4,9 +4,11 @@ import argparse
 import pdb
 import json
 import os
+import queue
 import re
 import sys
 import tempfile
+import threading
 import time
 import warnings
 from dataclasses import dataclass
@@ -29,6 +31,8 @@ from relbench.tasks import get_task  # type: ignore
 from task_history_queries import TASK_HISTORY_FEATURE_HINTS_REGISTRY  # type: ignore
 from zero_shot_llm import LocalLLM, MODEL_PATHS, extract_number  # type: ignore
 
+
+print_prompt = False
 
 @dataclass
 class Phase2FeaturePolicy:
@@ -221,6 +225,15 @@ class StaticSimilarityIndex:
     cat_cols: list[str]
 
 
+@dataclass
+class TrainDFSVectorDBIndex:
+    vectors: np.ndarray
+    norms: np.ndarray
+    feature_vocab: list[str]
+    feature_to_idx: dict[str, int]
+    row_meta: pd.DataFrame
+
+
 def _build_single_task_inference_config(
     *,
     dataset: str,
@@ -243,6 +256,19 @@ def _build_single_task_inference_config(
         "task_download": True,
         "datasets": [{"name": dataset, "tasks": [task]}],
     }
+
+
+def _resolve_self_history_min_gap(task_object: Any) -> pd.Timedelta:
+    raw_gap = getattr(task_object, "timedelta", None)
+    if raw_gap is None:
+        return pd.Timedelta(0)
+    try:
+        parsed = pd.to_timedelta(raw_gap)
+    except Exception:
+        return pd.Timedelta(0)
+    if pd.isna(parsed) or parsed <= pd.Timedelta(0):
+        return pd.Timedelta(0)
+    return parsed
 
 
 def _build_example_pool(
@@ -284,12 +310,20 @@ def _sample_history_before_query(
     entity_value: Any,
     query_time: pd.Timestamp,
     history_length: int,
+    min_history_gap: pd.Timedelta,
 ) -> list[dict[str, Any]]:
     if pool_df.empty:
         return []
-    subset = pool_df[
-        (pool_df[entity_col] == entity_value) & (pool_df[time_col] < query_time)
-    ]
+    if min_history_gap > pd.Timedelta(0):
+        safe_cutoff = query_time - min_history_gap
+        subset = pool_df[
+            (pool_df[entity_col] == entity_value)
+            & (pool_df[time_col] <= safe_cutoff)
+        ]
+    else:
+        subset = pool_df[
+            (pool_df[entity_col] == entity_value) & (pool_df[time_col] < query_time)
+        ]
     if subset.empty:
         return []
     subset = subset.sort_values(by=[time_col], kind="stable")
@@ -587,6 +621,337 @@ def _query_feature_cache_key(entity_value: Any, cutoff_time: Any) -> tuple[str, 
     return (_entity_key(entity_value), int(pd.Timestamp(cutoff_time).value))
 
 
+def _load_train_dfs_vector_db_index(
+    *,
+    phase2_task_dir: Path,
+    resource: Any,
+) -> TrainDFSVectorDBIndex | None:
+    db_dir = phase2_task_dir / "dfs_train_vector_db"
+    if not db_dir.exists():
+        return None
+
+    vectors_path = db_dir / "vectors.npy"
+    norms_path = db_dir / "norms.npy"
+    vocab_path = db_dir / "feature_vocab.json"
+    row_meta_path = db_dir / "row_meta.csv"
+    if not (vectors_path.exists() and norms_path.exists() and vocab_path.exists() and row_meta_path.exists()):
+        return None
+
+    vectors = np.load(vectors_path)
+    norms = np.load(norms_path)
+    vocab_json = _read_json(vocab_path)
+    feature_vocab = vocab_json.get("features", [])
+    if not isinstance(feature_vocab, list):
+        return None
+    feature_vocab = [str(x) for x in feature_vocab]
+    row_meta = pd.read_csv(row_meta_path)
+
+    if vectors.ndim != 2:
+        return None
+    if norms.ndim != 1:
+        return None
+    if vectors.shape[0] != norms.shape[0]:
+        return None
+    if vectors.shape[1] != len(feature_vocab):
+        return None
+    if len(row_meta) != vectors.shape[0]:
+        return None
+
+    # Normalize/validate metadata columns to match runtime retrieval fields.
+    required_meta = {"entity", "time", "target"}
+    if not required_meta.issubset(set(row_meta.columns)):
+        return None
+    row_meta = row_meta.copy()
+    parsed_time = pd.to_datetime(row_meta["time"], errors="coerce")
+    valid_time_mask = parsed_time.notna().to_numpy()
+    if not np.all(valid_time_mask):
+        vectors = vectors[valid_time_mask]
+        norms = norms[valid_time_mask]
+        row_meta = row_meta.loc[valid_time_mask].reset_index(drop=True)
+        parsed_time = pd.to_datetime(row_meta["time"], errors="coerce")
+    row_meta["time"] = parsed_time
+
+    row_meta = row_meta.rename(
+        columns={
+            "entity": resource.entity_col,
+            "time": resource.time_col,
+            "target": resource.output_col,
+        }
+    )
+    row_meta["__entity_key"] = row_meta[resource.entity_col].map(_entity_key)
+
+    return TrainDFSVectorDBIndex(
+        vectors=vectors.astype(np.float32, copy=False),
+        norms=norms.astype(np.float32, copy=False),
+        feature_vocab=feature_vocab,
+        feature_to_idx={k: i for i, k in enumerate(feature_vocab)},
+        row_meta=row_meta,
+    )
+
+
+def _vectorize_query_features(
+    query_features: dict[str, float],
+    *,
+    feature_to_idx: dict[str, int],
+    dim: int,
+) -> np.ndarray:
+    out = np.zeros((dim,), dtype=np.float32)
+    for key, value in query_features.items():
+        idx = feature_to_idx.get(key)
+        if idx is None:
+            continue
+        out[idx] = np.float32(value)
+    return out
+
+
+def _select_other_entity_examples_by_train_vector_db(
+    *,
+    resource: Any,
+    index: TrainDFSVectorDBIndex,
+    query_features: dict[str, float],
+    entity_value: Any,
+    cutoff_time: pd.Timestamp,
+    max_rows: int,
+    neighbor_entity_count: int,
+    neighbor_history_count: int,
+) -> list[dict[str, Any]]:
+    if (
+        max_rows <= 0
+        or neighbor_entity_count <= 0
+        or neighbor_history_count <= 0
+    ):
+        return []
+
+    query_entity_key = _entity_key(entity_value)
+    meta = index.row_meta
+    meta = meta[meta["__entity_key"] != ""]
+    if meta.empty:
+        return []
+    meta = meta[meta[resource.time_col] < cutoff_time]
+    if meta.empty:
+        return []
+
+    selected_entity_keys: list[str] = []
+
+    # Primary path: DFS-vector similarity retrieval.
+    if query_features and index.vectors.size > 0:
+        query_vec = _vectorize_query_features(
+            query_features,
+            feature_to_idx=index.feature_to_idx,
+            dim=index.vectors.shape[1],
+        )
+        query_norm = float(np.linalg.norm(query_vec))
+        if query_norm > 0:
+            sim = np.dot(index.vectors, query_vec) / ((index.norms * query_norm) + 1e-8)
+            valid_mask = index.norms > 0
+            if np.any(valid_mask):
+                sim = np.where(valid_mask, sim, -1.0)
+                sim_idx = meta.index.to_numpy(dtype=np.int64)
+                sim_sub = sim[sim_idx]
+                if sim_sub.size > 0:
+                    ranked_local = np.argsort(-sim_sub)
+                    seen: set[str] = set()
+                    for local_i in ranked_local:
+                        row_i = int(sim_idx[int(local_i)])
+                        ek = str(meta.at[row_i, "__entity_key"])
+                        if not ek or ek == query_entity_key or ek in seen:
+                            continue
+                        seen.add(ek)
+                        selected_entity_keys.append(ek)
+                        if len(selected_entity_keys) >= neighbor_entity_count:
+                            break
+
+    # Task-agnostic fallback:
+    # When query DFS features are empty/zero (or similarity retrieval yields no peers),
+    # select recent peer entities before cutoff that have non-empty targets.
+    if not selected_entity_keys:
+        fallback_meta = meta[meta["__entity_key"] != query_entity_key].copy()
+        if not fallback_meta.empty:
+            output_series = fallback_meta[resource.output_col]
+            nonempty_mask = output_series.notna()
+            if pd.api.types.is_string_dtype(output_series):
+                nonempty_mask = nonempty_mask & (output_series.astype(str).str.strip() != "")
+            fallback_meta = fallback_meta[nonempty_mask]
+            if not fallback_meta.empty:
+                latest_per_entity = (
+                    fallback_meta.sort_values(
+                        by=[resource.time_col],
+                        ascending=False,
+                        kind="stable",
+                    )
+                    .drop_duplicates(subset=["__entity_key"], keep="first")
+                )
+                selected_entity_keys = (
+                    latest_per_entity["__entity_key"]
+                    .head(neighbor_entity_count)
+                    .astype(str)
+                    .tolist()
+                )
+
+    if not selected_entity_keys:
+        return []
+
+    records: list[dict[str, Any]] = []
+    for ek in selected_entity_keys:
+        entity_rows = meta[meta["__entity_key"] == ek]
+        if entity_rows.empty:
+            continue
+        recent_rows = (
+            entity_rows.sort_values(by=[resource.time_col], ascending=False, kind="stable")
+            .head(neighbor_history_count)
+            .sort_values(by=[resource.time_col], kind="stable")
+        )
+        for rec in recent_rows.to_dict(orient="records"):
+            out = {
+                resource.entity_col: rec.get(resource.entity_col),
+                resource.time_col: rec.get(resource.time_col),
+                resource.output_col: rec.get(resource.output_col),
+                "__example_scope": "other",
+            }
+            records.append(out)
+
+    records.sort(key=lambda rec: pd.Timestamp(rec[resource.time_col]))
+    if len(records) > max_rows:
+        records = records[-max_rows:]
+    return records
+
+
+def _prepare_prompt_pack_for_eval_items(
+    *,
+    batch_items: list[EvalItem],
+    dfs_builder: Any,
+    graph_store: RelBenchGraphRAGStore,
+    extractor: RowFeatureExtractor,
+    resource: Any,
+    args: argparse.Namespace,
+) -> tuple[list[str], list[dict[str, Any]]]:
+    all_rows: list[dict[str, Any]] = []
+    per_item_entry_rows: list[list[dict[str, Any]]] = []
+    for item in batch_items:
+        entry_rows = [dict(x) for x in item.history_rows] + [dict(item.query_row)]
+        per_item_entry_rows.append(entry_rows)
+        all_rows.extend(entry_rows)
+
+    all_feature_dicts = dfs_builder.feature_dicts_for_rows(all_rows)
+    cursor = 0
+    prompts: list[str] = []
+    outputs_meta: list[dict[str, Any]] = []
+    for item, entry_rows in zip(batch_items, per_item_entry_rows):
+        n = len(entry_rows)
+        precomputed_feature_dicts = all_feature_dicts[cursor : cursor + n]
+        cursor += n
+        precomputed_summaries = [[] for _ in entry_rows]
+
+        prompt = build_zero_shot_prompt(
+            store=graph_store,
+            extractor=extractor,
+            resource=resource,
+            query_row=item.query_row,
+            history_rows=item.history_rows,
+            top_k=max(1, int(args.top_k)),
+            num_hops=max(1, int(args.num_hops)),
+            include_hop_aggregation=False,
+            include_semantic_retrieval=False,
+            use_dfs=True,
+            dfs_context_builder=dfs_builder,
+            context_workers=1,
+            precomputed_entry_dfs_summaries=precomputed_summaries,
+            precomputed_entry_dfs_feature_dicts=precomputed_feature_dicts,
+            recent_context_k=0,
+            include_neighbors=False,
+            include_dfs_summary=False,
+            include_dfs_table=True,
+            other_neighbor_entity_count=max(0, int(args.other_neighbor_entity_count)),
+            other_neighbor_history_count=max(0, int(args.other_neighbor_history_count)),
+        )
+        prompts.append(_make_strict_numeric_prompt(prompt))
+        outputs_meta.append(
+            {
+                "row_index": item.row_index,
+                "entity": item.entity_value,
+                "timestamp": str(item.query_time),
+                "target": item.query_row.get(resource.output_col),
+                "history_len": len(item.history_rows),
+            }
+        )
+    return prompts, outputs_meta
+
+
+def _run_llm_for_prompt_pack(
+    *,
+    llm: LocalLLM,
+    prompts: list[str],
+    outputs_meta: list[dict[str, Any]],
+    llm_batch_size: int,
+    max_new_tokens: int,
+    print_predictions: bool,
+    breakpoint_on_nonpositive: bool,
+    breakpoint_large_gap_threshold: float,
+    predictions: list[float],
+    targets: list[float],
+    records: list[dict[str, Any]],
+) -> None:
+    for i in range(0, len(prompts), llm_batch_size):
+        prompt_batch = prompts[i : i + llm_batch_size]
+        meta_batch = outputs_meta[i : i + llm_batch_size]
+        raw_outputs = llm.generate_numeric_batch(
+            prompt_batch,
+            max_new_tokens=max(4, min(12, int(max_new_tokens))),
+        )
+        for meta, raw_text, used_prompt in zip(meta_batch, raw_outputs, prompt_batch):
+            pred = float(extract_number(raw_text))
+            try:
+                target = float(meta["target"])
+            except Exception:
+                target = float("nan")
+            if not np.isnan(target):
+                predictions.append(pred)
+                targets.append(target)
+            records.append(
+                {
+                    **meta,
+                    "prediction": pred,
+                    "raw_generation": raw_text,
+                    "abs_error": (abs(pred - target) if not np.isnan(target) else None),
+                }
+            )
+
+            
+            if print_predictions:
+                if print_prompt:
+                    print(used_prompt)
+                print(f"item_index={meta['row_index']}")
+                print(f"  entity={meta['entity']}")
+                print(f"  timestamp={meta['timestamp']}")
+                print(f"  prediction={pred} | ground_truth={meta['target']}")
+
+                if print_prompt:
+                    breakpoint()
+
+                # if pred == 0.0:
+                #     raw_preview = (raw_text or "").strip().replace("\n", "\\n")
+                #     if len(raw_preview) > 240:
+                #         raw_preview = raw_preview[:237] + "..."
+                #     print(f"  raw_generation='{raw_preview}'")
+            if _is_debug_breakpoint_prediction(
+                pred,
+                target,
+                large_gap_threshold=breakpoint_large_gap_threshold,
+            ) and breakpoint_on_nonpositive:
+                print(
+                    f"[phase3][debug] breakpoint prediction detected "
+                    f"(item_index={meta['row_index']}, prediction={pred})."
+                )
+                print("[phase3][debug] full_prompt_start")
+                print(used_prompt)
+                print("[phase3][debug] full_prompt_end")
+                print(
+                    "[phase3][debug] entering pdb "
+                    f"(prediction <= 0 or abs gap >= {breakpoint_large_gap_threshold})"
+                )
+                pdb.set_trace()
+
+
 def _build_query_feature_cache_for_rows(
     *,
     rows: list[dict[str, Any]],
@@ -877,6 +1242,25 @@ def run(args: argparse.Namespace) -> None:
         _build_static_similarity_index(resource) if args.use_static_similar_others else None
     )
     dfs_similarity_cutoff_cache: dict[int, dict[str, Any]] = {}
+    train_vector_db_index = (
+        _load_train_dfs_vector_db_index(phase2_task_dir=phase2_task_dir, resource=resource)
+        if args.other_example_search_mode == "train_vector_db"
+        else None
+    )
+    if args.other_example_search_mode == "train_vector_db" and train_vector_db_index is None:
+        raise FileNotFoundError(
+            "train_vector_db mode requested, but Phase 2 vector DB artifacts were not found "
+            f"under {phase2_task_dir / 'dfs_train_vector_db'}"
+        )
+    if args.other_example_search_mode == "train_vector_db":
+        assert train_vector_db_index is not None
+
+    self_history_min_gap = _resolve_self_history_min_gap(resource.task_object)
+    if self_history_min_gap > pd.Timedelta(0):
+        print(
+            "[phase3] leakage-safe self-history enabled: "
+            f"row_time + {self_history_min_gap} <= query_time"
+        )
 
     llm = LocalLLM(MODEL_PATHS[args.model_size], print_log=True)
     inference_start_time = time.perf_counter()
@@ -885,194 +1269,338 @@ def run(args: argparse.Namespace) -> None:
     predictions: list[float] = []
     targets: list[float] = []
     records: list[dict[str, Any]] = []
+    profiling_batches: list[dict[str, Any]] = []
+    prof_retrieval_total = 0.0
+    prof_dfs_prompt_total = 0.0
+    prof_llm_total = 0.0
+    profile_enabled = bool(args.profile_phase3)
+    profile_max_batches = max(0, int(args.profile_phase3_max_preprocess_batches))
+    processed_preprocess_batches = 0
+    profile_early_stop = False
     preprocess_batch_size = max(1, int(args.preprocess_batch_size))
     dfs_batch_size = max(1, int(args.dfs_batch_size))
     llm_batch_size = max(1, int(args.llm_batch_size))
     for pre_start in range(0, total_items, preprocess_batch_size):
+        pre_batch_start = time.perf_counter()
         pre_end = min(total_items, pre_start + preprocess_batch_size)
         pre_rows = test_rows[pre_start:pre_end]
-        eval_items: list[EvalItem] = []
+        retrieval_seconds = 0.0
+        dfs_prompt_seconds = 0.0
+        llm_seconds = 0.0
+        eval_items_count_for_batch = 0
         dfs_similarity_query_cache: dict[tuple[str, int], dict[str, float]] = {}
-        if args.other_example_search_mode == "dfs_similarity":
+        if args.other_example_search_mode in {"dfs_similarity", "train_vector_db"}:
             pre_rows_dicts = [row._asdict() for row in pre_rows]
             dfs_similarity_query_cache = _build_query_feature_cache_for_rows(
                 rows=pre_rows_dicts,
                 resource=resource,
                 dfs_builder=dfs_builder,
             )
+        if args.enable_cpu_gpu_pipeline:
+            prompt_queue: queue.Queue[Any] = queue.Queue(maxsize=max(1, int(args.pipeline_prompt_queue_size)))
+            producer_state: dict[str, Any] = {
+                "retrieval_seconds": 0.0,
+                "dfs_prompt_seconds": 0.0,
+                "eval_items": 0,
+                "error": None,
+            }
 
-        for offset, row in enumerate(pre_rows):
-            row_index = pre_start + offset
-            row_dict = row._asdict()
-            q_time = pd.Timestamp(row_dict[resource.time_col])
-            self_history_rows = _sample_history_before_query(
-                pool_df=pool_df,
-                entity_col=resource.entity_col,
-                time_col=resource.time_col,
-                output_col=resource.output_col,
-                entity_value=row_dict[resource.entity_col],
-                query_time=q_time,
-                history_length=args.history_length,
-            )
-            if args.other_example_search_mode == "dfs_similarity":
-                other_history_rows = _select_other_entity_examples_by_dfs_similarity(
-                    resource=resource,
-                    example_pool_df=pool_df,
-                    query_row=row_dict,
+            def _producer() -> None:
+                eval_buffer: list[EvalItem] = []
+                try:
+                    for offset, row in enumerate(pre_rows):
+                        row_start = time.perf_counter()
+                        row_index = pre_start + offset
+                        row_dict = row._asdict()
+                        q_time = pd.Timestamp(row_dict[resource.time_col])
+                        self_history_rows = _sample_history_before_query(
+                            pool_df=pool_df,
+                            entity_col=resource.entity_col,
+                            time_col=resource.time_col,
+                            output_col=resource.output_col,
+                            entity_value=row_dict[resource.entity_col],
+                            query_time=q_time,
+                            history_length=args.history_length,
+                            min_history_gap=self_history_min_gap,
+                        )
+                        if args.other_example_search_mode == "dfs_similarity":
+                            other_history_rows = _select_other_entity_examples_by_dfs_similarity(
+                                resource=resource,
+                                example_pool_df=pool_df,
+                                query_row=row_dict,
+                                entity_value=row_dict[resource.entity_col],
+                                cutoff_time=q_time,
+                                max_rows=max(0, args.other_example_max_count),
+                                neighbor_entity_count=max(0, args.other_neighbor_entity_count),
+                                neighbor_history_count=max(0, args.other_neighbor_history_count),
+                                dfs_builder=dfs_builder,
+                                cutoff_cache=dfs_similarity_cutoff_cache,
+                                cutoff_cache_size=max(0, int(args.dfs_similarity_cutoff_cache_size)),
+                                query_features_override=dfs_similarity_query_cache.get(
+                                    _query_feature_cache_key(
+                                        row_dict.get(resource.entity_col),
+                                        q_time,
+                                    )
+                                ),
+                            )
+                        elif args.other_example_search_mode == "train_vector_db":
+                            query_features = dfs_similarity_query_cache.get(
+                                _query_feature_cache_key(
+                                    row_dict.get(resource.entity_col),
+                                    q_time,
+                                ),
+                                {},
+                            )
+                            other_history_rows = _select_other_entity_examples_by_train_vector_db(
+                                resource=resource,
+                                index=train_vector_db_index,
+                                query_features=query_features,
+                                entity_value=row_dict[resource.entity_col],
+                                cutoff_time=q_time,
+                                max_rows=max(0, args.other_example_max_count),
+                                neighbor_entity_count=max(0, args.other_neighbor_entity_count),
+                                neighbor_history_count=max(0, args.other_neighbor_history_count),
+                            )
+                        else:
+                            other_history_rows = _select_other_entity_examples(
+                                graph_store=graph_store,
+                                resource=resource,
+                                example_pool_df=pool_df,
+                                entity_value=row_dict[resource.entity_col],
+                                cutoff_time=q_time,
+                                max_rows=max(0, args.other_example_max_count),
+                                neighbor_entity_count=max(0, args.other_neighbor_entity_count),
+                                neighbor_history_count=max(0, args.other_neighbor_history_count),
+                                neighbor_search_hops=max(1, args.other_neighbor_search_hops),
+                                top_k=max(1, args.top_k),
+                                static_similarity_index=static_similarity_index,
+                                use_static_similar_others=bool(args.use_static_similar_others),
+                            )
+                        history_rows = self_history_rows + other_history_rows
+                        history_rows.sort(key=lambda r: pd.Timestamp(r[resource.time_col]))
+                        eval_buffer.append(
+                            EvalItem(
+                                row_index=row_index,
+                                entity_value=row_dict[resource.entity_col],
+                                query_time=q_time,
+                                query_row=row_dict,
+                                history_rows=history_rows,
+                            )
+                        )
+                        producer_state["retrieval_seconds"] += time.perf_counter() - row_start
+                        producer_state["eval_items"] += 1
+
+                        if len(eval_buffer) >= dfs_batch_size:
+                            prep_start = time.perf_counter()
+                            prompts, outputs_meta = _prepare_prompt_pack_for_eval_items(
+                                batch_items=eval_buffer,
+                                dfs_builder=dfs_builder,
+                                graph_store=graph_store,
+                                extractor=extractor,
+                                resource=resource,
+                                args=args,
+                            )
+                            producer_state["dfs_prompt_seconds"] += time.perf_counter() - prep_start
+                            prompt_queue.put((prompts, outputs_meta))
+                            eval_buffer = []
+
+                    if eval_buffer:
+                        prep_start = time.perf_counter()
+                        prompts, outputs_meta = _prepare_prompt_pack_for_eval_items(
+                            batch_items=eval_buffer,
+                            dfs_builder=dfs_builder,
+                            graph_store=graph_store,
+                            extractor=extractor,
+                            resource=resource,
+                            args=args,
+                        )
+                        producer_state["dfs_prompt_seconds"] += time.perf_counter() - prep_start
+                        prompt_queue.put((prompts, outputs_meta))
+                except Exception as exc:
+                    producer_state["error"] = exc
+                finally:
+                    prompt_queue.put(None)
+
+            producer_thread = threading.Thread(target=_producer, daemon=True)
+            producer_thread.start()
+
+            llm_start = time.perf_counter()
+            while True:
+                payload = prompt_queue.get()
+                if payload is None:
+                    break
+                prompts, outputs_meta = payload
+                _run_llm_for_prompt_pack(
+                    llm=llm,
+                    prompts=prompts,
+                    outputs_meta=outputs_meta,
+                    llm_batch_size=llm_batch_size,
+                    max_new_tokens=int(args.max_new_tokens),
+                    print_predictions=bool(args.print_predictions),
+                    breakpoint_on_nonpositive=bool(args.breakpoint_on_nonpositive),
+                    breakpoint_large_gap_threshold=float(args.breakpoint_large_gap_threshold),
+                    predictions=predictions,
+                    targets=targets,
+                    records=records,
+                )
+            llm_seconds = time.perf_counter() - llm_start
+            producer_thread.join()
+            if producer_state.get("error") is not None:
+                raise RuntimeError("Pipeline producer failed") from producer_state["error"]
+            retrieval_seconds = float(producer_state["retrieval_seconds"])
+            dfs_prompt_seconds = float(producer_state["dfs_prompt_seconds"])
+            eval_items_count_for_batch = int(producer_state["eval_items"])
+        else:
+            eval_items: list[EvalItem] = []
+            retrieval_start = time.perf_counter()
+            for offset, row in enumerate(pre_rows):
+                row_index = pre_start + offset
+                row_dict = row._asdict()
+                q_time = pd.Timestamp(row_dict[resource.time_col])
+                self_history_rows = _sample_history_before_query(
+                    pool_df=pool_df,
+                    entity_col=resource.entity_col,
+                    time_col=resource.time_col,
+                    output_col=resource.output_col,
                     entity_value=row_dict[resource.entity_col],
-                    cutoff_time=q_time,
-                    max_rows=max(0, args.other_example_max_count),
-                    neighbor_entity_count=max(0, args.other_neighbor_entity_count),
-                    neighbor_history_count=max(0, args.other_neighbor_history_count),
-                    dfs_builder=dfs_builder,
-                    cutoff_cache=dfs_similarity_cutoff_cache,
-                    cutoff_cache_size=max(0, int(args.dfs_similarity_cutoff_cache_size)),
-                    query_features_override=dfs_similarity_query_cache.get(
+                    query_time=q_time,
+                    history_length=args.history_length,
+                    min_history_gap=self_history_min_gap,
+                )
+                if args.other_example_search_mode == "dfs_similarity":
+                    other_history_rows = _select_other_entity_examples_by_dfs_similarity(
+                        resource=resource,
+                        example_pool_df=pool_df,
+                        query_row=row_dict,
+                        entity_value=row_dict[resource.entity_col],
+                        cutoff_time=q_time,
+                        max_rows=max(0, args.other_example_max_count),
+                        neighbor_entity_count=max(0, args.other_neighbor_entity_count),
+                        neighbor_history_count=max(0, args.other_neighbor_history_count),
+                        dfs_builder=dfs_builder,
+                        cutoff_cache=dfs_similarity_cutoff_cache,
+                        cutoff_cache_size=max(0, int(args.dfs_similarity_cutoff_cache_size)),
+                        query_features_override=dfs_similarity_query_cache.get(
+                            _query_feature_cache_key(
+                                row_dict.get(resource.entity_col),
+                                q_time,
+                            )
+                        ),
+                    )
+                elif args.other_example_search_mode == "train_vector_db":
+                    query_features = dfs_similarity_query_cache.get(
                         _query_feature_cache_key(
                             row_dict.get(resource.entity_col),
                             q_time,
-                        )
-                    ),
-                )
-            else:
-                other_history_rows = _select_other_entity_examples(
-                    graph_store=graph_store,
-                    resource=resource,
-                    example_pool_df=pool_df,
-                    entity_value=row_dict[resource.entity_col],
-                    cutoff_time=q_time,
-                    max_rows=max(0, args.other_example_max_count),
-                    neighbor_entity_count=max(0, args.other_neighbor_entity_count),
-                    neighbor_history_count=max(0, args.other_neighbor_history_count),
-                    neighbor_search_hops=max(1, args.other_neighbor_search_hops),
-                    top_k=max(1, args.top_k),
-                    static_similarity_index=static_similarity_index,
-                    use_static_similar_others=bool(args.use_static_similar_others),
-                )
-            history_rows = self_history_rows + other_history_rows
-            history_rows.sort(key=lambda r: pd.Timestamp(r[resource.time_col]))
-            eval_items.append(
-                EvalItem(
-                    row_index=row_index,
-                    entity_value=row_dict[resource.entity_col],
-                    query_time=q_time,
-                    query_row=row_dict,
-                    history_rows=history_rows,
-                )
-            )
-
-        for start in range(0, len(eval_items), dfs_batch_size):
-            batch_items = eval_items[start : start + dfs_batch_size]
-            if not batch_items:
-                continue
-
-            all_rows: list[dict[str, Any]] = []
-            per_item_entry_rows: list[list[dict[str, Any]]] = []
-            for item in batch_items:
-                entry_rows = [dict(x) for x in item.history_rows] + [dict(item.query_row)]
-                per_item_entry_rows.append(entry_rows)
-                all_rows.extend(entry_rows)
-
-            all_feature_dicts = dfs_builder.feature_dicts_for_rows(all_rows)
-            cursor = 0
-            prompts: list[str] = []
-            outputs_meta: list[dict[str, Any]] = []
-            for item, entry_rows in zip(batch_items, per_item_entry_rows):
-                n = len(entry_rows)
-                precomputed_feature_dicts = all_feature_dicts[cursor : cursor + n]
-                cursor += n
-                precomputed_summaries = [[] for _ in entry_rows]
-
-                prompt = build_zero_shot_prompt(
-                    store=graph_store,
-                    extractor=extractor,
-                    resource=resource,
-                    query_row=item.query_row,
-                    history_rows=item.history_rows,
-                    top_k=max(1, int(args.top_k)),
-                    num_hops=max(1, int(args.num_hops)),
-                    include_hop_aggregation=False,
-                    include_semantic_retrieval=False,
-                    use_dfs=True,
-                    dfs_context_builder=dfs_builder,
-                    context_workers=1,
-                    precomputed_entry_dfs_summaries=precomputed_summaries,
-                    precomputed_entry_dfs_feature_dicts=precomputed_feature_dicts,
-                    recent_context_k=0,
-                    include_neighbors=False,
-                    include_dfs_summary=False,
-                    include_dfs_table=True,
-                    other_neighbor_entity_count=max(0, int(args.other_neighbor_entity_count)),
-                    other_neighbor_history_count=max(0, int(args.other_neighbor_history_count)),
-                )
-                prompts.append(_make_strict_numeric_prompt(prompt))
-                outputs_meta.append(
-                    {
-                        "row_index": item.row_index,
-                        "entity": item.entity_value,
-                        "timestamp": str(item.query_time),
-                        "target": item.query_row.get(resource.output_col),
-                        "history_len": len(item.history_rows),
-                    }
-                )
-
-            for i in range(0, len(prompts), llm_batch_size):
-                prompt_batch = prompts[i : i + llm_batch_size]
-                meta_batch = outputs_meta[i : i + llm_batch_size]
-                raw_outputs = llm.generate_numeric_batch(
-                    prompt_batch,
-                    max_new_tokens=max(4, min(12, int(args.max_new_tokens))),
-                )
-                for meta, raw_text, used_prompt in zip(meta_batch, raw_outputs, prompt_batch):
-                    pred = float(extract_number(raw_text))
-                    try:
-                        target = float(meta["target"])
-                    except Exception:
-                        target = float("nan")
-                    if not np.isnan(target):
-                        predictions.append(pred)
-                        targets.append(target)
-                    records.append(
-                        {
-                            **meta,
-                            "prediction": pred,
-                            "raw_generation": raw_text,
-                            "abs_error": (abs(pred - target) if not np.isnan(target) else None),
-                        }
+                        ),
+                        {},
                     )
-                    if args.print_predictions:
-                        print(f"item_index={meta['row_index']}")
-                        print(f"  entity={meta['entity']}")
-                        print(f"  timestamp={meta['timestamp']}")
-                        print(f"  prediction={pred} | ground_truth={meta['target']}")
-                        if pred == 0.0:
-                            raw_preview = (raw_text or "").strip().replace("\n", "\\n")
-                            if len(raw_preview) > 240:
-                                raw_preview = raw_preview[:237] + "..."
-                            print(f"  raw_generation='{raw_preview}'")
-                    if _is_debug_breakpoint_prediction(
-                        pred,
-                        target,
-                        large_gap_threshold=args.breakpoint_large_gap_threshold,
-                    ) and args.breakpoint_on_nonpositive:
-                        print(
-                            f"[phase3][debug] breakpoint prediction detected "
-                            f"(item_index={meta['row_index']}, prediction={pred})."
-                        )
-                        print("[phase3][debug] full_prompt_start")
-                        print(used_prompt)
-                        print("[phase3][debug] full_prompt_end")
-                        print(
-                            "[phase3][debug] entering pdb "
-                            f"(prediction <= 0 or abs gap >= {args.breakpoint_large_gap_threshold})"
-                        )
-                        pdb.set_trace()
+                    other_history_rows = _select_other_entity_examples_by_train_vector_db(
+                        resource=resource,
+                        index=train_vector_db_index,
+                        query_features=query_features,
+                        entity_value=row_dict[resource.entity_col],
+                        cutoff_time=q_time,
+                        max_rows=max(0, args.other_example_max_count),
+                        neighbor_entity_count=max(0, args.other_neighbor_entity_count),
+                        neighbor_history_count=max(0, args.other_neighbor_history_count),
+                    )
+                else:
+                    other_history_rows = _select_other_entity_examples(
+                        graph_store=graph_store,
+                        resource=resource,
+                        example_pool_df=pool_df,
+                        entity_value=row_dict[resource.entity_col],
+                        cutoff_time=q_time,
+                        max_rows=max(0, args.other_example_max_count),
+                        neighbor_entity_count=max(0, args.other_neighbor_entity_count),
+                        neighbor_history_count=max(0, args.other_neighbor_history_count),
+                        neighbor_search_hops=max(1, args.other_neighbor_search_hops),
+                        top_k=max(1, args.top_k),
+                        static_similarity_index=static_similarity_index,
+                        use_static_similar_others=bool(args.use_static_similar_others),
+                    )
+                history_rows = self_history_rows + other_history_rows
+                history_rows.sort(key=lambda r: pd.Timestamp(r[resource.time_col]))
+                eval_items.append(
+                    EvalItem(
+                        row_index=row_index,
+                        entity_value=row_dict[resource.entity_col],
+                        query_time=q_time,
+                        query_row=row_dict,
+                        history_rows=history_rows,
+                    )
+                )
+            retrieval_seconds = time.perf_counter() - retrieval_start
+            eval_items_count_for_batch = len(eval_items)
+
+            prompt_packs: list[tuple[list[str], list[dict[str, Any]]]] = []
+            dfs_prompt_start = time.perf_counter()
+            for start in range(0, len(eval_items), dfs_batch_size):
+                batch_items = eval_items[start : start + dfs_batch_size]
+                if not batch_items:
+                    continue
+                prompt_packs.append(
+                    _prepare_prompt_pack_for_eval_items(
+                        batch_items=batch_items,
+                        dfs_builder=dfs_builder,
+                        graph_store=graph_store,
+                        extractor=extractor,
+                        resource=resource,
+                        args=args,
+                    )
+                )
+            dfs_prompt_seconds = time.perf_counter() - dfs_prompt_start
+
+            llm_start = time.perf_counter()
+            for prompts, outputs_meta in prompt_packs:
+                _run_llm_for_prompt_pack(
+                    llm=llm,
+                    prompts=prompts,
+                    outputs_meta=outputs_meta,
+                    llm_batch_size=llm_batch_size,
+                    max_new_tokens=int(args.max_new_tokens),
+                    print_predictions=bool(args.print_predictions),
+                    breakpoint_on_nonpositive=bool(args.breakpoint_on_nonpositive),
+                    breakpoint_large_gap_threshold=float(args.breakpoint_large_gap_threshold),
+                    predictions=predictions,
+                    targets=targets,
+                    records=records,
+                )
+            llm_seconds = time.perf_counter() - llm_start
+
+        prof_retrieval_total += retrieval_seconds
+        prof_dfs_prompt_total += dfs_prompt_seconds
+        prof_llm_total += llm_seconds
+        processed_preprocess_batches += 1
+        batch_total_seconds = time.perf_counter() - pre_batch_start
+        if profile_enabled:
+            profiling_batches.append(
+                {
+                    "batch_index": int(processed_preprocess_batches - 1),
+                    "rows_start": int(pre_start),
+                    "rows_end_exclusive": int(pre_end),
+                    "rows_in_batch": int(len(pre_rows)),
+                    "eval_items": int(eval_items_count_for_batch),
+                    "retrieval_seconds": float(retrieval_seconds),
+                    "dfs_prompt_seconds": float(dfs_prompt_seconds),
+                    "llm_seconds": float(llm_seconds),
+                    "batch_total_seconds": float(batch_total_seconds),
+                }
+            )
 
         print(
             f"[phase3] processed rows {pre_end}/{total_items} "
             f"(preprocess_batch_size={preprocess_batch_size}, "
             f"dfs_batch_size={dfs_batch_size}, llm_batch_size={llm_batch_size})"
         )
+        if profile_enabled and profile_max_batches > 0 and processed_preprocess_batches >= profile_max_batches:
+            profile_early_stop = True
+            print(
+                f"[phase3][profile] early stop after {processed_preprocess_batches} "
+                f"preprocess batches."
+            )
+            break
 
     mae = _mae(predictions, targets)
     err_stats = _error_stats(predictions, targets)
@@ -1093,9 +1621,24 @@ def run(args: argparse.Namespace) -> None:
         "abs_error_variance": err_stats["abs_error_variance"],
         "abs_error_std": err_stats["abs_error_std"],
         "history_length": int(args.history_length),
+        "self_history_min_gap": str(self_history_min_gap),
+        "self_history_leakage_safe": bool(self_history_min_gap > pd.Timedelta(0)),
         "model_size": args.model_size,
+        "other_example_search_mode": args.other_example_search_mode,
+        "enable_cpu_gpu_pipeline": bool(args.enable_cpu_gpu_pipeline),
         "inference_seconds": float(inference_seconds),
+        "profile_phase3": bool(profile_enabled),
+        "profile_phase3_max_preprocess_batches": int(profile_max_batches),
+        "processed_preprocess_batches": int(processed_preprocess_batches),
+        "profile_early_stop": bool(profile_early_stop),
+        "timing_breakdown": {
+            "retrieval_seconds": float(prof_retrieval_total),
+            "dfs_prompt_seconds": float(prof_dfs_prompt_total),
+            "llm_seconds": float(prof_llm_total),
+        },
     }
+    if profile_enabled:
+        run_summary["profiling_batches"] = profiling_batches
 
     with (out_dir / "phase3_summary.json").open("w", encoding="utf-8") as f:
         json.dump(run_summary, f, indent=2, ensure_ascii=True)
@@ -1135,6 +1678,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--num-hops", type=int, default=2)
     parser.add_argument("--preprocess-batch-size", type=int, default=256)
     parser.add_argument("--dfs-batch-size", type=int, default=64)
+    parser.add_argument(
+        "--enable-cpu-gpu-pipeline",
+        action="store_true",
+        help=(
+            "Overlap CPU retrieval/DFS prompt preparation with GPU LLM generation "
+            "using a producer-consumer prompt queue."
+        ),
+    )
+    parser.add_argument(
+        "--pipeline-prompt-queue-size",
+        type=int,
+        default=2,
+        help="Prompt-pack queue depth used when --enable-cpu-gpu-pipeline is enabled.",
+    )
     parser.add_argument("--other-example-max-count", type=int, default=9)
     parser.add_argument("--other-neighbor-entity-count", type=int, default=3)
     parser.add_argument("--other-neighbor-history-count", type=int, default=3)
@@ -1152,11 +1709,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--other-example-search-mode",
         type=str,
         default="dfs_similarity",
-        choices=["graph_static", "dfs_similarity"],
+        choices=["graph_static", "dfs_similarity", "train_vector_db"],
         help=(
             "How to select 'other examples': "
             "'graph_static' (existing graph/static strategy) or "
-            "'dfs_similarity' (query DFS feature similarity)."
+            "'dfs_similarity' (query DFS feature similarity) or "
+            "'train_vector_db' (nearest neighbors over Phase 2 train DFS vector DB)."
         ),
     )
     parser.add_argument(
@@ -1192,6 +1750,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=_DEBUG_LARGE_GAP_THRESHOLD,
         help="Absolute-error threshold used by --breakpoint-on-nonpositive (default: 10).",
     )
+    parser.add_argument(
+        "--profile-phase3",
+        action="store_true",
+        help="Enable phase3 timing profiling and include per-batch timing in summary JSON.",
+    )
+    parser.add_argument(
+        "--profile-phase3-max-preprocess-batches",
+        type=int,
+        default=1,
+        help=(
+            "When --profile-phase3 is enabled, stop after this many preprocess batches. "
+            "Set 0 to disable early stop."
+        ),
+    )
     return parser
 
 
@@ -1205,6 +1777,10 @@ def main() -> None:
         raise ValueError("--dfs-batch-size must be > 0")
     if args.llm_batch_size <= 0:
         raise ValueError("--llm-batch-size must be > 0")
+    if args.pipeline_prompt_queue_size <= 0:
+        raise ValueError("--pipeline-prompt-queue-size must be > 0")
+    if args.profile_phase3_max_preprocess_batches < 0:
+        raise ValueError("--profile-phase3-max-preprocess-batches must be >= 0")
     run(args)
 
 

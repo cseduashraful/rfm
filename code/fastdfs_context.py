@@ -414,6 +414,8 @@ def build_fastdfs_context_builder(
     max_metapath_groups: int = 5,
     max_features_per_metapath: int = 100,
     engine_path: str | None = None,
+    include_tables: set[str] | None = None,
+    include_table_columns: dict[str, set[str]] | None = None,
 ):
     try:
         import fastdfs
@@ -424,28 +426,54 @@ def build_fastdfs_context_builder(
             "and run zero_shot with that Python interpreter."
         ) from exc
 
+    all_table_names = set(resource.db.table_dict.keys())
+    selected_tables = set(all_table_names)
+    if include_tables is not None:
+        selected_tables = {t for t in include_tables if t in all_table_names}
+        selected_tables.add(resource.entity_table)
+
     tables: Dict[str, pd.DataFrame] = {}
     primary_keys: Dict[str, str] = {}
     time_columns: Dict[str, str] = {}
     foreign_keys: list[tuple[str, str, str, str]] = []
+    required_cols_by_table: dict[str, set[str]] = {t: set() for t in selected_tables}
 
-    for table_name, table in resource.db.table_dict.items():
-        df = table.df.copy()
-        tables[table_name] = df
-
-        if table.pkey_col is not None and table.pkey_col in df.columns:
+    for table_name in selected_tables:
+        table = resource.db.table_dict[table_name]
+        if table.pkey_col is not None and table.pkey_col in table.df.columns:
+            required_cols_by_table[table_name].add(table.pkey_col)
             primary_keys[table_name] = table.pkey_col
-
-        if table.time_col is not None and table.time_col in df.columns:
+        if table.time_col is not None and table.time_col in table.df.columns:
+            required_cols_by_table[table_name].add(table.time_col)
             time_columns[table_name] = table.time_col
+        if include_table_columns is not None:
+            required_cols_by_table[table_name].update(include_table_columns.get(table_name, set()))
 
+    for table_name in selected_tables:
+        table = resource.db.table_dict[table_name]
         for fk_col, parent_table in table.fkey_col_to_pkey_table.items():
-            if fk_col not in df.columns:
+            if parent_table not in selected_tables:
                 continue
             parent = resource.db.table_dict.get(parent_table)
             if parent is None or parent.pkey_col is None:
                 continue
+            if fk_col not in table.df.columns:
+                continue
+            if parent.pkey_col not in parent.df.columns:
+                continue
+            required_cols_by_table[table_name].add(fk_col)
+            required_cols_by_table[parent_table].add(parent.pkey_col)
             foreign_keys.append((table_name, fk_col, parent_table, parent.pkey_col))
+
+    prune_columns = include_table_columns is not None
+    for table_name in selected_tables:
+        table = resource.db.table_dict[table_name]
+        df = table.df.copy()
+        if prune_columns:
+            keep_cols = [c for c in df.columns if c in required_cols_by_table[table_name]]
+            if keep_cols:
+                df = df.loc[:, keep_cols].copy()
+        tables[table_name] = df
 
     if resource.entity_table not in resource.db.table_dict:
         raise ValueError(
@@ -489,5 +517,5 @@ def build_fastdfs_context_builder(
         strict_cutoff=True,
         training_window=training_window,
         training_window_key=active_window_key,
-        table_names=set(resource.db.table_dict.keys()),
+        table_names=set(tables.keys()),
     )
