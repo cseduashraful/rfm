@@ -311,7 +311,7 @@ def _sample_history_before_query(
     history_length: int,
     min_history_gap: pd.Timedelta,
 ) -> list[dict[str, Any]]:
-    if pool_df.empty:
+    if pool_df.empty or int(history_length) <= 0:
         return []
     if min_history_gap > pd.Timedelta(0):
         safe_cutoff = query_time - min_history_gap
@@ -332,6 +332,18 @@ def _sample_history_before_query(
     for rec in records:
         rec["__example_scope"] = "self"
     return records
+
+
+def _allocate_example_budget(
+    *,
+    total_budget: int,
+    min_other_examples: int,
+) -> tuple[int, int]:
+    total = max(0, int(total_budget))
+    min_other = max(0, min(int(min_other_examples), total))
+    self_quota = max(0, total - min_other)
+    other_quota = total - self_quota
+    return self_quota, other_quota
 
 
 def _entity_key(value: Any) -> str:
@@ -1323,6 +1335,10 @@ def run(args: argparse.Namespace) -> None:
                         row_index = pre_start + offset
                         row_dict = row._asdict()
                         q_time = pd.Timestamp(row_dict[resource.time_col])
+                        self_quota, _ = _allocate_example_budget(
+                            total_budget=args.history_length,
+                            min_other_examples=args.min_other_examples,
+                        )
                         self_history_rows = _sample_history_before_query(
                             pool_df=pool_df,
                             entity_col=resource.entity_col,
@@ -1330,9 +1346,10 @@ def run(args: argparse.Namespace) -> None:
                             output_col=resource.output_col,
                             entity_value=row_dict[resource.entity_col],
                             query_time=q_time,
-                            history_length=args.history_length,
+                            history_length=self_quota,
                             min_history_gap=self_history_min_gap,
                         )
+                        other_target_count = max(0, int(args.history_length) - len(self_history_rows))
                         if args.other_example_search_mode == "dfs_similarity":
                             other_history_rows = _select_other_entity_examples_by_dfs_similarity(
                                 resource=resource,
@@ -1340,7 +1357,7 @@ def run(args: argparse.Namespace) -> None:
                                 query_row=row_dict,
                                 entity_value=row_dict[resource.entity_col],
                                 cutoff_time=q_time,
-                                max_rows=max(0, args.other_example_max_count),
+                                max_rows=other_target_count,
                                 neighbor_entity_count=max(0, args.other_neighbor_entity_count),
                                 neighbor_history_count=max(0, args.other_neighbor_history_count),
                                 dfs_builder=dfs_builder,
@@ -1367,7 +1384,7 @@ def run(args: argparse.Namespace) -> None:
                                 query_features=query_features,
                                 entity_value=row_dict[resource.entity_col],
                                 cutoff_time=q_time,
-                                max_rows=max(0, args.other_example_max_count),
+                                max_rows=other_target_count,
                                 neighbor_entity_count=max(0, args.other_neighbor_entity_count),
                                 neighbor_history_count=max(0, args.other_neighbor_history_count),
                             )
@@ -1378,7 +1395,7 @@ def run(args: argparse.Namespace) -> None:
                                 example_pool_df=pool_df,
                                 entity_value=row_dict[resource.entity_col],
                                 cutoff_time=q_time,
-                                max_rows=max(0, args.other_example_max_count),
+                                max_rows=other_target_count,
                                 neighbor_entity_count=max(0, args.other_neighbor_entity_count),
                                 neighbor_history_count=max(0, args.other_neighbor_history_count),
                                 neighbor_search_hops=max(1, args.other_neighbor_search_hops),
@@ -1467,6 +1484,10 @@ def run(args: argparse.Namespace) -> None:
                 row_index = pre_start + offset
                 row_dict = row._asdict()
                 q_time = pd.Timestamp(row_dict[resource.time_col])
+                self_quota, _ = _allocate_example_budget(
+                    total_budget=args.history_length,
+                    min_other_examples=args.min_other_examples,
+                )
                 self_history_rows = _sample_history_before_query(
                     pool_df=pool_df,
                     entity_col=resource.entity_col,
@@ -1474,9 +1495,10 @@ def run(args: argparse.Namespace) -> None:
                     output_col=resource.output_col,
                     entity_value=row_dict[resource.entity_col],
                     query_time=q_time,
-                    history_length=args.history_length,
+                    history_length=self_quota,
                     min_history_gap=self_history_min_gap,
                 )
+                other_target_count = max(0, int(args.history_length) - len(self_history_rows))
                 if args.other_example_search_mode == "dfs_similarity":
                     other_history_rows = _select_other_entity_examples_by_dfs_similarity(
                         resource=resource,
@@ -1484,7 +1506,7 @@ def run(args: argparse.Namespace) -> None:
                         query_row=row_dict,
                         entity_value=row_dict[resource.entity_col],
                         cutoff_time=q_time,
-                        max_rows=max(0, args.other_example_max_count),
+                        max_rows=other_target_count,
                         neighbor_entity_count=max(0, args.other_neighbor_entity_count),
                         neighbor_history_count=max(0, args.other_neighbor_history_count),
                         dfs_builder=dfs_builder,
@@ -1511,7 +1533,7 @@ def run(args: argparse.Namespace) -> None:
                         query_features=query_features,
                         entity_value=row_dict[resource.entity_col],
                         cutoff_time=q_time,
-                        max_rows=max(0, args.other_example_max_count),
+                        max_rows=other_target_count,
                         neighbor_entity_count=max(0, args.other_neighbor_entity_count),
                         neighbor_history_count=max(0, args.other_neighbor_history_count),
                     )
@@ -1522,7 +1544,7 @@ def run(args: argparse.Namespace) -> None:
                         example_pool_df=pool_df,
                         entity_value=row_dict[resource.entity_col],
                         cutoff_time=q_time,
-                        max_rows=max(0, args.other_example_max_count),
+                        max_rows=other_target_count,
                         neighbor_entity_count=max(0, args.other_neighbor_entity_count),
                         neighbor_history_count=max(0, args.other_neighbor_history_count),
                         neighbor_search_hops=max(1, args.other_neighbor_search_hops),
@@ -1682,12 +1704,21 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model-size", type=str, default="8b", choices=sorted(MODEL_PATHS.keys()))
     parser.add_argument("--llm-batch-size", type=int, default=2)
     parser.add_argument("--max-new-tokens", type=int, default=24)
-    parser.add_argument("--history-length", type=int, default=10)
+    parser.add_argument("--history-length", type=int, default=50)
     parser.add_argument("--history-sampling-strategy", type=str, default="most_recent_k")
     parser.add_argument("--top-k", type=int, default=20)
     parser.add_argument("--num-hops", type=int, default=2)
     parser.add_argument("--preprocess-batch-size", type=int, default=256)
     parser.add_argument("--dfs-batch-size", type=int, default=64)
+    parser.add_argument(
+        "--min-other-examples",
+        type=int,
+        default=10,
+        help=(
+            "Minimum number of 'other' examples to reserve within the total "
+            "--history-length budget when available."
+        ),
+    )
     parser.add_argument(
         "--enable-cpu-gpu-pipeline",
         action="store_true",
@@ -1781,6 +1812,8 @@ def main() -> None:
     args = build_arg_parser().parse_args()
     if args.history_length <= 0:
         raise ValueError("--history-length must be > 0")
+    if args.min_other_examples < 0:
+        raise ValueError("--min-other-examples must be >= 0")
     if args.preprocess_batch_size <= 0:
         raise ValueError("--preprocess-batch-size must be > 0")
     if args.dfs_batch_size <= 0:
