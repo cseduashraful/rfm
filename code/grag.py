@@ -1379,6 +1379,7 @@ def build_zero_shot_prompt(
     include_neighbors=True,
     include_dfs_summary=True,
     include_dfs_table=False,
+    include_raw_examples=True,
     other_neighbor_entity_count=5,
     other_neighbor_history_count=3,
 ):
@@ -1687,19 +1688,20 @@ def build_zero_shot_prompt(
             example_scope = str(row.get("__example_scope", "self" if not is_query else "query"))
             show_recent_context = idx > max(0, len(entry_contexts) - max(0, int(recent_context_k)))
 
-            lines.append("")
-
-            if is_query:
-                lines.append(
-                    f"Query: {format_task_query_row(resource.task, _visible_row_fields(row), resource.time_col, resource.output_col)}"
-                )
-            else:
-                # if idx == 1:
-                #     lines.append()
-                lines.append(
-                    f"Example {idx} [{example_scope}]: "
-                    f"{format_task_query_row(resource.task, _visible_row_fields(row), resource.time_col, resource.output_col)}"
-                )
+            if include_raw_examples:
+                lines.append("")
+                if is_query:
+                    lines.append(
+                        f"Query: {format_task_query_row(resource.task, _visible_row_fields(row), resource.time_col, resource.output_col)}"
+                    )
+                else:
+                    lines.append(
+                        f"Example {idx} [{example_scope}]: "
+                        f"{format_task_query_row(resource.task, _visible_row_fields(row), resource.time_col, resource.output_col)}"
+                    )
+            elif is_query and show_recent_context:
+                lines.append("")
+                lines.append("Query Context:")
 
             # ---- neighbors ----
             if include_neighbors and context["neighbors"] and show_recent_context:
@@ -1743,7 +1745,7 @@ def build_zero_shot_prompt(
                         lines.append(f"  history: {history_text}")
 
             # ---- output ----
-            if not is_query:
+            if include_raw_examples and not is_query:
                 lines.append(f"Output [{example_scope}]: {row[resource.output_col]}")
 
     if use_dfs and include_dfs_table:

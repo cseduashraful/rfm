@@ -722,11 +722,16 @@ def _select_other_entity_examples_by_train_vector_db(
         return []
 
     query_entity_key = _entity_key(entity_value)
+    min_history_gap = _resolve_self_history_min_gap(resource.task_object)
     meta = index.row_meta
     meta = meta[meta["__entity_key"] != ""]
     if meta.empty:
         return []
-    meta = meta[meta[resource.time_col] < cutoff_time]
+    if min_history_gap > pd.Timedelta(0):
+        safe_cutoff = cutoff_time - min_history_gap
+        meta = meta[meta[resource.time_col] <= safe_cutoff]
+    else:
+        meta = meta[meta[resource.time_col] < cutoff_time]
     if meta.empty:
         return []
 
@@ -860,6 +865,7 @@ def _prepare_prompt_pack_for_eval_items(
             include_neighbors=True,
             include_dfs_summary=True,
             include_dfs_table=True,
+            include_raw_examples=False,
             other_neighbor_entity_count=max(0, int(args.other_neighbor_entity_count)),
             other_neighbor_history_count=max(0, int(args.other_neighbor_history_count)),
         )
@@ -1019,13 +1025,18 @@ def _select_other_entity_examples_by_dfs_similarity(
         return []
 
     query_entity_key = _entity_key(entity_value)
+    min_history_gap = _resolve_self_history_min_gap(resource.task_object)
     cutoff_ns = int(pd.Timestamp(cutoff_time).value)
     cache_entry: dict[str, Any] | None = None
     if cutoff_cache is not None:
         cache_entry = cutoff_cache.get(cutoff_ns)
 
     if cache_entry is None:
-        pool_all = example_pool_df[example_pool_df[resource.time_col] < cutoff_time].copy()
+        if min_history_gap > pd.Timedelta(0):
+            safe_cutoff = cutoff_time - min_history_gap
+            pool_all = example_pool_df[example_pool_df[resource.time_col] <= safe_cutoff].copy()
+        else:
+            pool_all = example_pool_df[example_pool_df[resource.time_col] < cutoff_time].copy()
         if pool_all.empty:
             return []
         pool_all["__entity_key"] = pool_all[resource.entity_col].map(_entity_key)
