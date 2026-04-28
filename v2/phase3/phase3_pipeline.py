@@ -925,7 +925,7 @@ def _run_llm_for_prompt_pack(
                 print(f"  timestamp={meta['timestamp']}")
                 print(f"  prediction={pred} | ground_truth={meta['target']}")
 
-                if print_prompt:
+                if print_prompt and pred - meta['target'] > 200:
                     breakpoint()
 
                 # if pred == 0.0:
@@ -1693,7 +1693,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Prompt-pack queue depth used when --enable-cpu-gpu-pipeline is enabled.",
     )
     parser.add_argument("--other-example-max-count", type=int, default=9)
-    parser.add_argument("--other-neighbor-entity-count", type=int, default=3)
+    parser.add_argument("--other-neighbor-entity-count", type=int, default=10)
     parser.add_argument("--other-neighbor-history-count", type=int, default=3)
     parser.add_argument("--other-neighbor-search-hops", type=int, default=2)
     parser.add_argument(

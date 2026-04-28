@@ -16,25 +16,63 @@ conda activate ~/envs/llm
 
 
 
+# python v2/phase1/phase1_pipeline.py \
+#   --config v2/phase1/phase1_config_rel_trial.yaml
 
 
-
-
-# #phase 2
 # python v2/phase2/phase2_pipeline.py \
 #   --dataset rel-trial \
 #   --task study-adverse \
 #   --phase1-artifacts-dir v2/phase1/artifacts \
+#   --output-dir v2/phase2/artifacts \
 #   --model-size 8b \
-#   --dfs-train-vector-db-prune-schema \
-#   --task-output-dir v2/phase2/artifacts
-##phase 3
-# python v2/phase3/phase3_pipeline.py   --dataset rel-trial   --task study-adverse \
-#     --phase2-artifacts-dir v2/phase2/artifacts   --output-dir v2/phase3/artifacts \
-#     --other-example-search-mode train_vector_db   --model-size 8b   --llm-batch-size 4 \
-#     --history-length 10   --preprocess-batch-size 128 \
-#     --enable-cpu-gpu-pipeline   --pipeline-prompt-queue-size 2 \
-#     --print-predictions 
+#   --max-rounds 3
+
+python v2/phase3/phase3_pipeline.py \
+  --dataset rel-trial \
+  --task study-adverse \
+  --phase2-artifacts-dir v2/phase2/artifacts \
+  --output-dir v2/phase3/artifacts \
+  --model-size 8b \
+  --llm-batch-size 8 --dfs-batch-size 128 --preprocess-batch-size 128 \
+  --history-length 10 \
+  --print-predictions --breakpoint-on-nonpositive --breakpoint-large-gap-threshold 300
+
+
+
+
+# python v2/phase1/phase1_pipeline.py \
+#   --config v2/phase1/phase1_config_rel_f1.yaml
+
+
+# python v2/phase2/phase2_pipeline.py \
+#   --dataset rel-f1 \
+#   --task driver-position \
+#   --phase1-artifacts-dir v2/phase1/artifacts \
+#   --output-dir v2/phase2/artifacts \
+#   --model-size 8b \
+#   --max-rounds 3
+
+# python v2/phase3/phase3_pipeline.py \
+#   --dataset rel-f1 \
+#   --task driver-position \
+#   --phase2-artifacts-dir v2/phase2/artifacts \
+#   --output-dir v2/phase3/artifacts \
+#   --model-size 8b \
+#   --llm-batch-size 8 --dfs-batch-size 128 --preprocess-batch-size 128 \
+#   --history-length 10 \
+#   --print-predictions 
+
+
+
+
+
+
+
+
+
+
+
 
 
 
@@ -47,20 +85,20 @@ conda activate ~/envs/llm
 #   --dfs-train-vector-db-prune-schema \
 #   --task-output-dir v2/phase2/artifacts
 # # #phase 3
-python v2/phase3/phase3_pipeline.py   --dataset rel-f1   --task driver-position   \
-    --phase2-artifacts-dir v2/phase2/artifacts   --output-dir v2/phase3/artifacts       \
-    --other-example-search-mode train_vector_db   --model-size 8b   --llm-batch-size 2       \
-    --history-length 10   --preprocess-batch-size 64       \
-    --enable-cpu-gpu-pipeline   --pipeline-prompt-queue-size 2     \
-    --print-predictions 
 
+# python v2/phase3/phase3_pipeline.py   --dataset rel-f1   --task driver-position  \
+#     --phase2-artifacts-dir v2/phase2/artifacts   --output-dir v2/phase3/artifacts       \
+#     --other-example-search-mode train_vector_db   --model-size 8b   --llm-batch-size 8       \
+#     --history-length 10   --dfs-batch-size 128 --preprocess-batch-size 128       \
+#     --enable-cpu-gpu-pipeline   --pipeline-prompt-queue-size 2     \
+#     --print-predictions 
 
-python v2/phase3/phase3_pipeline.py   --dataset rel-trial   --task study-adverse   \
-    --phase2-artifacts-dir v2/phase2/artifacts   --output-dir v2/phase3/artifacts       \
-    --other-example-search-mode train_vector_db   --model-size 8b   --llm-batch-size 8       \
-    --history-length 10   --dfs-batch-size 128 --preprocess-batch-size 128       \
-    --enable-cpu-gpu-pipeline   --pipeline-prompt-queue-size 2     \
-    --print-predictions 
+# python v2/phase3/phase3_pipeline.py   --dataset rel-trial   --task study-adverse   \
+#     --phase2-artifacts-dir v2/phase2/artifacts   --output-dir v2/phase3/artifacts       \
+#     --other-example-search-mode train_vector_db   --model-size 8b   --llm-batch-size 8       \
+#     --history-length 10   --dfs-batch-size 128 --preprocess-batch-size 128       \
+#     --enable-cpu-gpu-pipeline   --pipeline-prompt-queue-size 2     \
+#     --print-predictions 
 
 
 
@@ -79,10 +117,10 @@ python v2/phase3/phase3_pipeline.py   --dataset rel-trial   --task study-adverse
 
 
 
-python v2/phase1/phase1_pipeline.py \
-  --dataset rel-trial \
-  --output-dir v2/phase1/artifacts \
-  --max-path-depth 8 \
-  --sampling-row-threshold 50000 \
-  --sample-size 50000
+# python v2/phase1/phase1_pipeline.py \
+#   --dataset rel-trial \
+#   --output-dir v2/phase1/artifacts \
+#   --max-path-depth 8 \
+#   --sampling-row-threshold 50000 \
+#   --sample-size 50000
 

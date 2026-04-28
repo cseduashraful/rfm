@@ -1357,6 +1357,7 @@ def build_zero_shot_prompt(
         lines.append("- If the query row has feature values, compare them with recent self and neighbor rows.")
         lines.append("- Identify rows with similar feature patterns and use their outputs as guidance.")
         lines.append("- Prefer examples that are both recent and feature-similar.")
+        lines.append("- Identify which features vary across examples and explain output differences.")
         lines.append("- Use similarity to adjust the prediction, not to copy values directly.")
     elif table_only_mode and False:
         lines.append("Data Usage:")
