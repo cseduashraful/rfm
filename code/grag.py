@@ -1342,29 +1342,20 @@ def build_zero_shot_prompt(
                 self_items.append((row, row_features))
 
         lines: List[str] = []
-        lines.append("Prompt Signal Summary:")
         if self_items:
             self_outputs = [
                 _parse_float_like(row.get(resource.output_col))
                 for row, _ in self_items
             ]
             self_outputs = [x for x in self_outputs if x is not None]
-            recent_self_outputs = self_outputs[-3:]
-            if recent_self_outputs:
-                rendered = ", ".join(f"{val:g}" for val in recent_self_outputs)
-                lines.append(
-                    f"- Recent self outputs ({len(recent_self_outputs)} most recent): {rendered}."
-                )
-                if len(recent_self_outputs) >= 2:
-                    delta = recent_self_outputs[-1] - recent_self_outputs[0]
-                    if abs(delta) > 0:
-                        direction = "upward" if delta > 0 else "downward"
-                        lines.append(f"- Self trend over recent rows is {direction}.")
-        else:
-            lines.append("- No leakage-safe self history is available for this query.")
+            if self_outputs:
+                return []
+
+        lines.append("Prompt Signal Summary:")
+        lines.append("- No leakage-safe self history is available for this query.")
 
         if query_item is not None and other_items:
-            query_row, query_features = query_item
+            _, query_features = query_item
             scored_neighbors: List[tuple[float, Dict[str, Any], List[str]]] = []
             for row, row_features in other_items:
                 score, matched = _signal_feature_match_summary(
