@@ -1162,6 +1162,70 @@ def summarize_neighbors_by_hop(neighbors):
     return summaries
 
 
+def select_important_neighbors(
+    neighbors,
+    *,
+    dataset: str | None = None,
+    task: str | None = None,
+    max_neighbors: int = 20,
+):
+    if not neighbors:
+        return []
+
+    feature_hints = get_task_history_feature_hints(dataset, task) or {}
+    hinted_tables = {
+        str(table_name).lower(): int(weight)
+        for table_name, weight in feature_hints.get("tables", {}).items()
+    }
+
+    def _token_set(text: Any) -> set[str]:
+        return {tok for tok in re.split(r"[^a-zA-Z0-9]+", str(text).lower()) if tok}
+
+    task_tokens = _token_set(task)
+    scored = []
+    for idx, neighbor in enumerate(neighbors):
+        table_name = str(neighbor.get("table", "")).lower()
+        etype = neighbor.get("etype") or ()
+        etype_tokens = _token_set(" ".join(str(x) for x in etype))
+        text_tokens = _token_set(neighbor.get("source_text", ""))
+
+        score = 0
+        score += 5 * hinted_tables.get(table_name, 0)
+        score += 3 * len(task_tokens & etype_tokens)
+        score += 1 * len(task_tokens & text_tokens)
+
+        hop = int(neighbor.get("hop", 99))
+        ts = neighbor.get("source_key", (None, None, 0))[2]
+        ts_val = int(ts) if isinstance(ts, (int, np.integer)) else 0
+        scored.append((score, -hop, ts_val, -idx, neighbor))
+
+    scored.sort(reverse=True)
+
+    selected = []
+    seen = set()
+    for _, _, _, _, neighbor in scored:
+        dedupe_key = (
+            neighbor.get("source_key"),
+            neighbor.get("neighbor_entity"),
+            neighbor.get("hop"),
+        )
+        if dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
+        selected.append(neighbor)
+        if len(selected) >= max(1, int(max_neighbors)):
+            break
+
+    selected.sort(
+        key=lambda item: (
+            int(item.get("hop", 99)),
+            str(item.get("table", "")),
+            str(item.get("source_text", "")),
+        )
+    )
+    return selected
+
+
 def render_neighbor_graph(neighbors):
     lines = []
     grouped_by_hop = {}
@@ -1639,16 +1703,26 @@ def build_zero_shot_prompt(
 
             # ---- neighbors ----
             if include_neighbors and context["neighbors"] and show_recent_context:
-                if include_hop_aggregation:
+                important_neighbors = select_important_neighbors(
+                    context["neighbors"],
+                    dataset=getattr(resource, "dataset", None),
+                    task=getattr(resource, "task", None),
+                    max_neighbors=top_k,
+                )
+                if include_hop_aggregation and important_neighbors:
                     lines.append("Neighbor Summary:")
-                    for summary in summarize_neighbors_by_hop(context["neighbors"]):
+                    for summary in summarize_neighbors_by_hop(important_neighbors):
                         lines.append(
                             f"- hop {summary['hop']}: {summary['count']} neighbors"
                             + (f" ({summary['tables']})" if summary["tables"] else "")
                         )
 
-                lines.append("Neighbors:")
-                lines.extend(render_neighbor_graph(context["neighbors"]))
+                if important_neighbors:
+                    lines.append("Important k-hop Neighbors:")
+                    lines.extend(render_neighbor_graph(important_neighbors))
+                else:
+                    lines.append("Important k-hop Neighbors:")
+                    lines.append("- No high-signal graph neighbors available for this timestamp.")
 
             if use_dfs and include_dfs_summary and show_recent_context:
                 lines.append("DFS Summary:")
