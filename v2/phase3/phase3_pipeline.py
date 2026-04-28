@@ -293,7 +293,6 @@ def _build_example_pool(
     if not required.issubset(set(pooled.columns)):
         return pd.DataFrame(columns=[entity_col, time_col, output_col])
 
-    pooled = pooled[[entity_col, time_col, output_col]]
     pooled[time_col] = pd.to_datetime(pooled[time_col], errors="coerce")
     pooled = pooled.dropna(subset=[time_col]).reset_index(drop=True)
     pooled = pooled.sort_values(by=[time_col], kind="stable").reset_index(drop=True)

@@ -12,6 +12,63 @@ import pandas as pd
 from task_history_queries import get_task_history_feature_hints
 
 
+def _parse_float_like(value: Any) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, (int, float, np.integer, np.floating)):
+        try:
+            if pd.isna(value):
+                return None
+        except Exception:
+            pass
+        return float(value)
+    text = str(value).strip()
+    if not text or text == "?":
+        return None
+    try:
+        return float(text)
+    except Exception:
+        return None
+
+
+def _signal_feature_match_summary(
+    *,
+    query_features: Dict[str, Any],
+    candidate_features: Dict[str, Any],
+    max_items: int = 3,
+) -> tuple[float, List[str]]:
+    feature_names = sorted(set(query_features.keys()) & set(candidate_features.keys()))
+    if not feature_names:
+        return -1.0, []
+
+    score = 0.0
+    matched: List[str] = []
+    compared = 0
+    for feature_name in feature_names:
+        q_val = query_features.get(feature_name, "")
+        c_val = candidate_features.get(feature_name, "")
+        if q_val in ("", "?") or c_val in ("", "?"):
+            continue
+        compared += 1
+        q_num = _parse_float_like(q_val)
+        c_num = _parse_float_like(c_val)
+        if q_num is not None and c_num is not None:
+            denom = max(abs(q_num), abs(c_num), 1.0)
+            closeness = max(0.0, 1.0 - abs(q_num - c_num) / denom)
+            score += closeness
+            if closeness >= 0.85 and len(matched) < max_items:
+                matched.append(feature_name)
+            continue
+        if str(q_val) == str(c_val):
+            score += 1.0
+            if len(matched) < max_items:
+                matched.append(feature_name)
+
+    if compared == 0:
+        return -1.0, []
+    return score / compared, matched
+
+
 @dataclass
 class RelBenchGraphRAGStore:
     # ---------- ID maps ----------
@@ -1263,6 +1320,87 @@ def build_zero_shot_prompt(
 ):
     table_only_mode = include_dfs_table and not include_neighbors and not include_dfs_summary
 
+    def _build_table_signal_summary(
+        entry_rows: List[Dict[str, Any]],
+        entry_feature_dicts: List[Dict[str, Any]],
+    ) -> List[str]:
+        if not entry_rows or not entry_feature_dicts:
+            return []
+
+        self_items: List[tuple[Dict[str, Any], Dict[str, Any]]] = []
+        other_items: List[tuple[Dict[str, Any], Dict[str, Any]]] = []
+        query_item: tuple[Dict[str, Any], Dict[str, Any]] | None = None
+        for idx, (row, row_features) in enumerate(zip(entry_rows, entry_feature_dicts)):
+            is_query_row = idx == len(entry_rows) - 1
+            if is_query_row:
+                query_item = (row, row_features)
+                continue
+            scope = str(row.get("__example_scope", "self"))
+            if scope == "other":
+                other_items.append((row, row_features))
+            else:
+                self_items.append((row, row_features))
+
+        lines: List[str] = []
+        lines.append("Prompt Signal Summary:")
+        if self_items:
+            self_outputs = [
+                _parse_float_like(row.get(resource.output_col))
+                for row, _ in self_items
+            ]
+            self_outputs = [x for x in self_outputs if x is not None]
+            recent_self_outputs = self_outputs[-3:]
+            if recent_self_outputs:
+                rendered = ", ".join(f"{val:g}" for val in recent_self_outputs)
+                lines.append(
+                    f"- Recent self outputs ({len(recent_self_outputs)} most recent): {rendered}."
+                )
+                if len(recent_self_outputs) >= 2:
+                    delta = recent_self_outputs[-1] - recent_self_outputs[0]
+                    if abs(delta) > 0:
+                        direction = "upward" if delta > 0 else "downward"
+                        lines.append(f"- Self trend over recent rows is {direction}.")
+        else:
+            lines.append("- No leakage-safe self history is available for this query.")
+
+        if query_item is not None and other_items:
+            query_row, query_features = query_item
+            scored_neighbors: List[tuple[float, Dict[str, Any], List[str]]] = []
+            for row, row_features in other_items:
+                score, matched = _signal_feature_match_summary(
+                    query_features=query_features,
+                    candidate_features=row_features,
+                )
+                if score < 0:
+                    continue
+                scored_neighbors.append((score, row, matched))
+            scored_neighbors.sort(
+                key=lambda item: (
+                    -item[0],
+                    pd.Timestamp(item[1].get(resource.time_col)).value
+                    if item[1].get(resource.time_col) is not None
+                    else -1,
+                )
+            )
+            top_neighbors = scored_neighbors[:3]
+            if top_neighbors:
+                rendered_neighbors: List[str] = []
+                neighbor_outputs: List[float] = []
+                for score, row, matched in top_neighbors:
+                    out_val = _parse_float_like(row.get(resource.output_col))
+                    if out_val is not None:
+                        neighbor_outputs.append(out_val)
+                    match_text = ", ".join(matched[:2]) if matched else "overall feature profile"
+                    rendered_neighbors.append(
+                        f"{row.get(resource.output_col)} at {row.get(resource.time_col)} ({match_text})"
+                    )
+                lines.append("- Closest peer rows to the query: " + "; ".join(rendered_neighbors) + ".")
+                if neighbor_outputs:
+                    lines.append(
+                        f"- Closest peer output range: {min(neighbor_outputs):g} to {max(neighbor_outputs):g}."
+                    )
+        return lines
+
     def _visible_row_fields(row: Dict[str, Any]) -> Dict[str, Any]:
         return {k: v for k, v in row.items() if not str(k).startswith("__")}
 
@@ -1359,6 +1497,10 @@ def build_zero_shot_prompt(
         lines.append("- Prefer examples that are both recent and feature-similar.")
         lines.append("- Identify which features vary across examples and explain output differences.")
         lines.append("- Use similarity to adjust the prediction, not to copy values directly.")
+        signal_summary_lines = _build_table_signal_summary(entry_rows, entry_dfs_feature_dicts)
+        if signal_summary_lines:
+            lines.append("")
+            lines.extend(signal_summary_lines)
     elif table_only_mode and False:
         lines.append("Data Usage:")
         lines.append("- Use the DFS Feature Table below as the only context.")
